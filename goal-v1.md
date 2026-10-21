@@ -20,7 +20,7 @@ Fork 自 [smithersai/claude-p](https://github.com/smithersai/claude-p)：在不�
    ▼                         │
 claude-p (Zig) ── 0 参数 → src/pi/  交互模式
    ├─ zmux NativeSession ── claude (pty, fullscreen)
-   ├─ ghostty-vt 网格 ── 每帧 → ~/claude/-p/scr (纯文本, 调试用)
+   ├─ ghostty-vt 网格 ── 每帧 → ~/claude/-p/scr (纯文本, 调试用; 文件存在才写, 退出时删)
    ├─ 按键路由: 前缀触发 / Ctrl+C / Ctrl+Enter / Ctrl+P / Tab
    ├─ 叠加层: 下拉菜单, 居中 dialog, 涂抹 (gum 风格)
    ├─ hook FIFO ← --settings 注入的 Notification/Stop/SessionStart
@@ -45,7 +45,10 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
 | `//` + Tab | 打开 fzf 选 Chrome 标签页（按域名或标题），选中后截图，插入 `@/tmp/…png` |
 | `//gh/` + Tab | 按站点前缀补全 URL，来源是标签页列表和历史 |
 | 单行输入且以 `/~/` 开头时按回车 | 拦截 Enter：`mkdir -p ~/claude/X`（`/~/wtf` → `~/claude/wtf`），把 `cd '~/claude/X' && npx cld-pi` 复制到剪贴板（`wl-copy`，回退 `xclip` / `pbcopy`），dialog 提示到新终端粘贴。当前会话不切目录、不 `/clear` |
-| Ctrl+C 退出 CC | 转发给 CC 的最后一个键是 Ctrl+C 且 CC 随即退出（3 秒内）时，删除该会话在 `~/.claude/projects/` 下的对话（`<session>.jsonl` 和同名目录），退出后打印删除的路径 |
+| Ctrl+C 退出 CC | 转发给 CC 的最后一个键是 Ctrl+C 且 CC 随即退出（3 秒内）时，把该会话的 `<session>.jsonl` 移到 `~/claude/last`（同名目录移到 `last.d`，覆盖上一次），打印 `To restore #> mv ~/claude/last <原路径>`；没有用户消息的空会话不动、不输出。鼠标移动、焦点上报、kitty 的按键释放和单独的修饰键不算“最后一个键” |
+| 鼠标滚轮 | 默认原样透传（`pi.arg.whlSpeed = 0`）：滚动期间叠加层完全让开，滚轮停下 150ms 且输出静止 40ms 后再画回来；`whlSpeed = n` 时改成 n 格一次 PgUp / PgDn（方向改变或停顿 500ms 重新计数）。每次滚动向插件发 `wheel(dir)` 事件 |
+| 双击 | 单纯的左键双击（400ms 内、同一行相差 ≤1 格）：第一下照常给 CC，第二下变成顺着上次滚轮方向的 PgUp / PgDn |
+| `cld-pi -a <cmd>` | 套 claude 以外的 TUI（不注入 hook / settings）；界面识别用 `pi.arg.border` / `prompt` / `bash` / `busy` / `running`，默认值是 CC 的硬编码（优化路径） |
 | Ctrl+C | 输入框为空时透传给 CC（打断或退出）；不为空时只清掉**光标所在行及下方**的输入行，保留前面的换行，光标停在新的空行上 |
 | Ctrl+Enter | 读剪贴板（`wl-paste`，回退 `xclip` / `pbpaste`），用 bracketed paste 注入后回车执行。需要终端发出 `CSI 13;5u`（kitty 协议）或 `CSI 27;5;13~`（modifyOtherKeys），否则和 Enter 无法区分 |
 | Ctrl+P | 打开设置面板 |
@@ -68,7 +71,7 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
 | 命令 | 实现 |
 |---|---|
 | `/m` | `pi.sh` 启动 `~/.local/bin/magpie panel`；找不到就弹窗，OK 复制安装命令 `curl -fsSL https://usemagpie.ai/install.sh \| sh` |
-| `/w`（`webpane.js`，同时发布 `pi.ext.webpane`） | 如果:3001没有，后台运行 `npx @cloudcli-ai/cloudcli`，像 http-server 那样在 dialog 里列出 局域网 IP 和 tailscale 地址、localhost |
+| `/w`（`webpane.js`，同时发布 `pi.ext.webpane`） | 如果:3001没有，后台运行 `npx @cloudcli-ai/cloudcli`，像 http-server 那样在 dialog 里列出 局域网 IP 和 tailscale 地址、localhost；三个按钮：复制局域网地址 / 复制 tailscale 地址 / 显示 tailscale 二维码（`npx qrcode-terminal`，转成半格字符放进 body） |
 | `/ad X` | `/add-dir X`（等到 "Yes, for this session" 就回车确认），然后 `!tree -L 2 X` |
 | `/o` | 打开概览 WebUI（见下） |
 
@@ -84,6 +87,14 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
   ```
 - 提到哪个站点就往 `~/.F12-mcp.json` 的 `allowedUrlPattern` 追加一条（可热加载）。该文件必须事先存在，否则 `--watchConfig` 会报错，所以插件要先创建它。
 
+实现说明（`js/plugins/f12.js`，CDP 客户端在 `js/cdp.js`，只用 Node 自带的 `WebSocket` / `node:sqlite`）：
+- 连接：`CLAUDE_P_CDP=<端口|URL>`（agent 测试用 9224）优先，否则读 Chrome 用户目录里的 `DevToolsActivePort`（chrome://inspect 打开远程调试后写出）。整个会话复用一条连接（每条新连接 Chrome 都可能要用户点 Allow；1.5 秒没连上就弹非模态提示）。
+- `pi.complete(prefix, source, pick)`：fzf 选中后不直接输入，先把那一行交给 `pick(item, tok)`，输入它返回的文字（null 不输入）。Zig 侧：`complete_result` 带 `pick:true` 时回 `picked`，等 `pick_result`。
+- `//` + Tab：候选是 `标题 — 域名`；选中后 `Page.captureScreenshot`（后台标签不绘制，超时就 `Target.activateTarget` 再截一次），写到 `$TMPDIR/cld-pi-<域名>-<时间>.png`，输入 `@路径 `。
+- `//gh/` + Tab：标签页 URL 在前，历史（最近使用的 profile 的 `History`，复制一份再读）在后；站点名是域名前缀，或按顺序出现在域名第一段里（`gh` → github.com）。
+- 站点 → `allowedUrlPattern`：`<协议>//<host>/*`。文件不存在时写 `{}`（不能写空数组，MCP 会拒绝空的 `allowedUrlPattern`）。
+- MCP 提示：第一次 `//` 截图后，`~/.claude.json` 里没有 `chrome-devtools` 就弹出安装命令（Copy / Later），只提示一次（`~/claude/-p/f12-mcp-offered`）。chrome-devtools-mcp 1.11.0 还没有 `--watchConfig`，只会打印 Unknown arguments，不影响启动。
+
 ### 概览 WebUI
 - 从 transcript JSONL 生成类似 ChatGPT 的「每轮提问前缀」目录，sidecar 起一个本地 http 服务。
 - 用 `chrome --app=http://127.0.0.1:PORT --window-size=420,800` 打开成小窗口。
@@ -93,6 +104,9 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
 - 用 `--settings` 内联注入 Notification、Stop、SessionStart hook，沿用原项目的 FIFO 机制。
 - Notification 和 Stop 事件 → `notify-send`；事件同时转发给插件的 `pi.on`。由默认插件 `js/plugins/notify.js` 实现：终端有焦点时（CC 打开了焦点上报 `?1004`）不弹。
 - 默认插件 `js/plugins/herdry.js`：`pi.notify` 时把标签标题换成 CC 风格的旋转字符 + 消息（`·✢*✶✻✽✻✶*✢`），直到终端获得焦点再恢复。Yakuake 用 `setTabTitle`（Konsole 会话 `/Sessions/N` 对应 Yakuake 终端 N-1，并核对 D-Bus 名字的 owner），Konsole 用 `Session.setTitle(1)`，Guake 用 `rename_tab_uuid($GUAKE_TAB_UUID)`，其他终端用 OSC 2 窗口标题。
+- 滚轮防抖：滚轮滚动期间（最近一次滚轮上报 150ms 内）CC 的帧直接输出，角标 / 右上角提示 / 涂抹层等输出静止 40ms 后再补画一次；模态 dialog 和菜单仍每帧重画。
+- 非模态 dialog：←/→ 选过之后 Enter 按下、Esc 关闭（直到有键交给 CC）；按钮可以鼠标点击（模态 dialog 也可以）；每次交互重新计时。
+- `pi.notify(msg, 'snack' | 'snackRD')`：文字放到右上角角标（替换 `◆ plugins n/m`）或右下角，点进去仍是插件列表；默认插件 `pace.js` 用右下角显示上一条 ● 的耗时（下一条在路上时实时计时）和近 3 分钟的花费（复用 session.js 的计价和去重）；滚轮滚动时变透明（`{ bg: 'none' }`），停下 0.5s 恢复。第三个参数 `{ bg }` 设背景：0-255、`'#rrggbb'`、`'none'`。
 - 插件列表：右上角 `◆ plugins n/m` 角标，鼠标点击（SGR 鼠标上报）打开一行一个按钮的 dialog（`eachRow: 'vertical'`），Enter 开关某个插件；关闭即撤销它的 pi.on / pi.sed / 定时器（宿主 hook 了 setInterval / setTimeout）。
 
 ### 首次运行
@@ -112,7 +126,7 @@ echo 'claude-p-w(){ BUFFER=claude-p; zle accept-line }; zle -N claude-p-w; bindk
 | **P2 叠加层和按键** ✅ 待手测 | gum 风格的下拉菜单、dialog、涂抹层（同步输出，CC 每帧画完后重新涂）；kitty 键盘协议；Ctrl+Enter 粘贴执行；hook 事件接 notify-send | 500 | 60 | CC 正在流式输出时打开 dialog 不闪烁，关闭后画面完全恢复 |
 | **P3 插件系统和默认插件** ✅ 待手测 | 插件 API；加载 `~/claude/-p/*.js`；`/m`、`/w`、`/ad` | 150 | 350 | 写一个用户插件能自动加载，3 个默认命令都能用 |
 | **P4 Ctrl+P 面板** ✅ 待手测 | 按钮；session 名和花费；bash 输出涂抹开关；基于 pi.dialog({}) 的面板 | 350 | 250 | 每个控件都和 CC 实际状态同步（改完后从状态栏读回来核对） |
-| **P5 浏览器** | 预检查；`//` 选标签页截图；`//gh/` 补全；维护 `~/.F12-mcp.json`；提示 MCP 安装命令 | 50 | 350 | 能选中标签页截图并插入 `@png`，Claude 能读到 |
+| **P5 浏览器** ✅ 待手测 | 预检查；`//` 选标签页截图；`//gh/` 补全；维护 `~/.F12-mcp.json`；提示 MCP 安装命令 | 50 | 350 | 能选中标签页截图并插入 `@png`，Claude 能读到 |
 | **P6 概览 WebUI** | JSONL 转目录；chrome app 小窗口；进 Ctrl+O，按 Ctrl+Home 跳到顶部，然后一边 PgDn 一边 poll | 100 | 350 | 50 轮的会话里点任意一条都能定位到 |
 | **合计** | | ~2000 | ~1600 | |
 

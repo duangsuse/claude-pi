@@ -52,8 +52,17 @@ pub const Box = struct {
     }
 };
 
-const border_cp: u21 = 0x2500; // ─
-const prompt_cp: u21 = 0x276F; // ❯
+/// What identifies the TUI's parts on screen. The defaults are CC's (the
+/// hardcoded fast path); `pi.arg.border` / `prompt` / `bash` / `busy` /
+/// `running` override them for another TUI (`cld-pi -a <cmd>`).
+pub const Rules = struct {
+    border: u21 = 0x2500, // ─, a full-width row of it
+    prompt: u21 = 0x276F, // ❯ + space/NBSP opens the input box
+    bash: u21 = '!', // same, in bash mode
+    busy: []const u8 = "esc to interrupt",
+    running: []const u8 = "Running\u{2026}",
+};
+
 const nbsp: u21 = 0xA0;
 
 fn cellAt(term: *vt.Terminal, x: usize, y: usize) ?vt.PageList.Cell {
@@ -65,19 +74,16 @@ fn cp(term: *vt.Terminal, x: usize, y: usize) u21 {
     return c.cell.codepoint();
 }
 
-fn isBorderRow(term: *vt.Terminal, y: usize) bool {
-    for (0..term.cols) |x| if (cp(term, x, y) != border_cp) return false;
+fn isBorderRow(term: *vt.Terminal, y: usize, rules: *const Rules) bool {
+    for (0..term.cols) |x| if (cp(term, x, y) != rules.border) return false;
     return true;
 }
 
-fn promptMode(term: *vt.Terminal, y: usize) ?Mode {
+fn promptMode(term: *vt.Terminal, y: usize, rules: *const Rules) ?Mode {
     const sep = cp(term, 1, y);
     if (sep != nbsp and sep != ' ') return null;
-    return switch (cp(term, 0, y)) {
-        prompt_cp => .prompt,
-        '!' => .bash,
-        else => null,
-    };
+    const c = cp(term, 0, y);
+    return if (c == rules.prompt) .prompt else if (c == rules.bash) .bash else null;
 }
 
 const RowText = struct { text: []u8, faint_only: bool, cursor_col: ?usize };
@@ -126,13 +132,17 @@ fn rowText(allocator: std.mem.Allocator, term: *vt.Terminal, y: usize, cursor_x:
 /// Find CC's input box (the bottom-most one). Null while a dialog or
 /// anything else has replaced it.
 pub fn inputBox(allocator: std.mem.Allocator, term: *vt.Terminal) !?Box {
+    return inputBoxWith(allocator, term, &.{});
+}
+
+pub fn inputBoxWith(allocator: std.mem.Allocator, term: *vt.Terminal, rules: *const Rules) !?Box {
     var y: usize = term.rows;
     var below: ?usize = null;
     while (y > 0) {
         y -= 1;
-        if (!isBorderRow(term, y)) continue;
+        if (!isBorderRow(term, y, rules)) continue;
         if (below) |b| {
-            if (b - y >= 2) if (promptMode(term, y + 1)) |mode| return try buildBox(allocator, term, y, b, mode);
+            if (b - y >= 2) if (promptMode(term, y + 1, rules)) |mode| return try buildBox(allocator, term, y, b, mode);
         }
         below = y;
     }
@@ -176,14 +186,14 @@ pub fn contains(allocator: std.mem.Allocator, term: *vt.Terminal, needle: []cons
 }
 
 /// CC is running a turn (spinner + "esc to interrupt" in the status line).
-pub fn isBusy(allocator: std.mem.Allocator, term: *vt.Terminal) bool {
-    return contains(allocator, term, "esc to interrupt");
+pub fn isBusy(allocator: std.mem.Allocator, term: *vt.Terminal, rules: *const Rules) bool {
+    return contains(allocator, term, rules.busy);
 }
 
 /// A `!` command (or any tool) is still executing: its result line reads
 /// "⎿ ␣Running…" (space + NBSP).
-pub fn commandRunning(allocator: std.mem.Allocator, term: *vt.Terminal) bool {
-    return contains(allocator, term, "Running\u{2026}");
+pub fn commandRunning(allocator: std.mem.Allocator, term: *vt.Terminal, rules: *const Rules) bool {
+    return contains(allocator, term, rules.running);
 }
 
 // -------- tests --------
@@ -251,17 +261,26 @@ test "dialog replaces the box" {
     try testing.expect((try inputBox(testing.allocator, &g.term)) == null);
 }
 
+test "rules: another TUI's glyphs don't match CC's box" {
+    const g = try load("typed");
+    defer g.destroy(testing.allocator);
+    try testing.expect((try inputBoxWith(testing.allocator, &g.term, &.{ .prompt = '>' })) == null);
+    var b = (try inputBoxWith(testing.allocator, &g.term, &.{ .prompt = '>', .bash = 0x276F })).?;
+    defer b.deinit(testing.allocator);
+    try testing.expectEqual(Mode.bash, b.mode);
+}
+
 test "busy vs idle" {
     const g = try load("busy");
     defer g.destroy(testing.allocator);
-    try testing.expect(isBusy(testing.allocator, &g.term));
+    try testing.expect(isBusy(testing.allocator, &g.term, &.{}));
     var b = (try inputBox(testing.allocator, &g.term)).?;
     defer b.deinit(testing.allocator);
     try testing.expect(b.empty);
 
     const g2 = try load("cleared");
     defer g2.destroy(testing.allocator);
-    try testing.expect(!isBusy(testing.allocator, &g2.term));
+    try testing.expect(!isBusy(testing.allocator, &g2.term, &.{}));
     var b2 = (try inputBox(testing.allocator, &g2.term)).?;
     defer b2.deinit(testing.allocator);
     try testing.expect(b2.empty);

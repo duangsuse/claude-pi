@@ -2,6 +2,8 @@
 // from the transcript JSONL, model / effort / permission mode off the
 // screen, Bash output blocks for the hide toggle. Pure functions.
 
+import { closeSync, openSync, readSync, statSync } from 'node:fs'
+
 // $ per million tokens. From the Claude API reference bundled with Claude
 // Code (model table cached 2026-10-06). cacheRead: models whose cache reads
 // aren't the usual 0.1x of input. Cache writes: 1.25x input (5-minute TTL),
@@ -51,11 +53,33 @@ export function usageCost(model, u) {
   )
 }
 
+/** Entries of a JSONL text; lines that don't parse are skipped. */
+export function parseEntries(text) {
+  const out = []
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue
+    try {
+      out.push(JSON.parse(line))
+    } catch {}
+  }
+  return out
+}
+
 /**
- * Summarize a transcript (JSONL text): total cost, session name, last model.
- * An assistant message is logged once per content block with the same
- * usage, so messages are counted once by id.
+ * An entry's cost the first time its assistant message shows up, else
+ * undefined. A message is logged once per content block with the same
+ * usage, so `seen` (message ids) makes it count once. null: unpriced model.
  */
+export function messageCost(d, seen) {
+  const m = d.message
+  if (d.type !== 'assistant' || !m?.usage) return undefined
+  const id = m.id ?? d.uuid
+  if (seen.has(id)) return undefined
+  seen.add(id)
+  return usageCost(m.model, m.usage)
+}
+
+/** Summarize a transcript (JSONL text): total cost, session name, last model. */
 export function summarizeTranscript(text) {
   const seen = new Set()
   let cost = 0
@@ -63,27 +87,58 @@ export function summarizeTranscript(text) {
   let title = null
   let aiTitle = null
   let model = null
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue
-    let d
-    try {
-      d = JSON.parse(line)
-    } catch {
-      continue
-    }
+  for (const d of parseEntries(text)) {
     if (d.type === 'custom-title' && d.customTitle) title = d.customTitle
     if (d.type === 'ai-title' && d.aiTitle) aiTitle = d.aiTitle
-    const m = d.message
-    if (d.type !== 'assistant' || !m?.usage) continue
-    if (m.model) model = m.model
-    const id = m.id ?? d.uuid
-    if (seen.has(id)) continue
-    seen.add(id)
-    const c = usageCost(m.model, m.usage)
-    if (c == null) unpriced++
-    else cost += c
+    if (d.type === 'assistant' && d.message?.usage && d.message.model) model = d.message.model
+    const c = messageCost(d, seen)
+    if (c === null) unpriced++
+    else if (c !== undefined) cost += c
   }
   return { cost, unpriced, name: title ?? aiTitle, model }
+}
+
+/**
+ * Follow a growing JSONL file: each call returns the entries appended since
+ * the last one (a partial last line waits for its newline). Starts over
+ * when the path changes or the file shrinks.
+ */
+export function tailEntries(read = readFrom) {
+  let path = null
+  let offset = 0
+  let partial = Buffer.alloc(0)
+  return p => {
+    if (p !== path) [path, offset, partial] = [p, 0, Buffer.alloc(0)]
+    if (!p) return []
+    const r = read(p, offset)
+    if (!r) return []
+    if (r.from < offset) partial = Buffer.alloc(0)
+    offset = r.from + r.buf.length
+    const buf = Buffer.concat([partial, r.buf])
+    const nl = buf.lastIndexOf(10)
+    partial = buf.subarray(nl + 1)
+    return nl < 0 ? [] : parseEntries(buf.subarray(0, nl + 1).toString('utf8'))
+  }
+}
+
+/** Bytes of `path` from `offset` on (from 0 if it shrank): { buf, from }. */
+function readFrom(path, offset) {
+  try {
+    const size = statSync(path).size
+    const from = size < offset ? 0 : offset
+    const buf = Buffer.alloc(size - from)
+    if (buf.length) {
+      const fd = openSync(path, 'r')
+      try {
+        readSync(fd, buf, 0, buf.length, from)
+      } finally {
+        closeSync(fd)
+      }
+    }
+    return { buf, from }
+  } catch {
+    return null
+  }
 }
 
 // ---- reading CC's status line ----

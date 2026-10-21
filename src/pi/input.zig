@@ -144,6 +144,86 @@ pub fn lastFocus(bytes: []const u8) ?bool {
     return res;
 }
 
+/// Whether a stdin chunk carries a wheel report anywhere (SGR mouse button
+/// 64 / 65, any modifiers). Fast scrolling glues several into one read.
+pub fn hasWheel(bytes: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, i, "\x1b[<")) |at| {
+        i = at + 3;
+        const end = std.mem.indexOfScalarPos(u8, bytes, i, ';') orelse return false;
+        const b = std.fmt.parseInt(u16, bytes[i..end], 10) catch continue;
+        if (isWheelButton(b)) return true;
+    }
+    return false;
+}
+
+/// An SGR mouse report starting at `bytes[at]` ("\x1b[<b;x;yM"): its
+/// length and button, or null.
+fn sgrMouseAt(bytes: []const u8, at: usize) ?struct { len: usize, button: u16 } {
+    if (!std.mem.startsWith(u8, bytes[at..], "\x1b[<")) return null;
+    var i = at + 3;
+    while (i < bytes.len and (std.ascii.isDigit(bytes[i]) or bytes[i] == ';')) i += 1;
+    if (i >= bytes.len or (bytes[i] != 'M' and bytes[i] != 'm')) return null;
+    const semi = std.mem.indexOfScalarPos(u8, bytes[0..i], at + 3, ';') orelse return null;
+    const b = std.fmt.parseInt(u16, bytes[at + 3 .. semi], 10) catch return null;
+    return .{ .len = i + 1 - at, .button = b };
+}
+
+fn isWheelButton(b: u16) bool {
+    return b & 64 != 0 and b & 128 == 0 and b & 3 < 2;
+}
+
+/// Take the wheel reports out of a stdin chunk: the rest goes to `rest`,
+/// the return value is the net notches (negative = up, towards history).
+pub fn splitWheel(a: std.mem.Allocator, bytes: []const u8, rest: *std.ArrayList(u8)) !i32 {
+    var net: i32 = 0;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (sgrMouseAt(bytes, i)) |m| {
+            if (isWheelButton(m.button)) {
+                net += if (m.button & 1 == 0) -1 else 1;
+            } else try rest.appendSlice(a, bytes[i..][0..m.len]);
+            i += m.len;
+            continue;
+        }
+        try rest.append(a, bytes[i]);
+        i += 1;
+    }
+    return net;
+}
+
+/// A chunk that isn't the user pressing a key: only mouse reports, focus
+/// reports, kitty key-release events and bare modifier keys (CC may ask for
+/// those). Lets "the last key was Ctrl+C" survive the Ctrl release and
+/// mouse motion that arrive before CC exits.
+pub fn isNoise(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        if (sgrMouseAt(bytes, i)) |m| {
+            i += m.len;
+            continue;
+        }
+        if (!std.mem.startsWith(u8, bytes[i..], "\x1b[")) return false;
+        var j = i + 2;
+        while (j < bytes.len and (std.ascii.isDigit(bytes[j]) or bytes[j] == ';' or bytes[j] == ':')) j += 1;
+        if (j >= bytes.len) return false;
+        const params = bytes[i + 2 .. j];
+        switch (bytes[j]) {
+            'I', 'O' => if (params.len != 0) return false,
+            'u', '~' => {
+                const release = std.mem.indexOf(u8, params, ":3") != null;
+                const code = std.fmt.parseInt(u32, params[0 .. std.mem.indexOfAny(u8, params, ";:") orelse params.len], 10) catch 0;
+                // Kitty's functional codes for Shift/Ctrl/Alt/Super/… (L and R).
+                if (!release and !(code >= 57441 and code <= 57452)) return false;
+            },
+            else => return false,
+        }
+        i = j + 1;
+    }
+    return true;
+}
+
 /// The name plugins hook a key by (`pi.on({ CtrlP() {} })`): Ctrl / Shift
 /// combinations only. Writes into `buf`.
 pub fn hookName(key: Key, buf: []u8) ?[]const u8 {
@@ -321,6 +401,41 @@ test "decode legacy, kitty CSI-u and modifyOtherKeys" {
     try t.expectEqual(Key{ .mouse = .{ .button = 0, .x = 97, .y = 0, .press = true } }, decode("\x1b[<0;98;1M"));
     try t.expectEqual(Key{ .mouse = .{ .button = 0, .x = 4, .y = 9, .press = false } }, decode("\x1b[<0;5;10m"));
     try t.expectEqual(Key.other, decode("\x1b[<0;98;1M\x1b[<0;98;1m"));
+}
+
+test "hasWheel" {
+    const t = std.testing;
+    try t.expect(hasWheel("\x1b[<64;10;5M"));
+    try t.expect(hasWheel("\x1b[<35;1;1M\x1b[<65;10;5M\x1b[<65;10;5M"));
+    try t.expect(hasWheel("\x1b[<69;10;5M")); // shift + down
+    try t.expect(!hasWheel("\x1b[<0;10;5M"));
+    try t.expect(!hasWheel("\x1b[<35;10;5M")); // motion
+    try t.expect(!hasWheel("\x1b[<66;10;5M")); // wheel left/right
+    try t.expect(!hasWheel("\x1b[A"));
+}
+
+test "splitWheel" {
+    const t = std.testing;
+    var rest: std.ArrayList(u8) = .{};
+    defer rest.deinit(t.allocator);
+    try t.expectEqual(@as(i32, -2), try splitWheel(t.allocator, "\x1b[<64;5;5M\x1b[<35;6;6M\x1b[<64;5;5M", &rest));
+    try t.expectEqualStrings("\x1b[<35;6;6M", rest.items);
+    rest.clearRetainingCapacity();
+    try t.expectEqual(@as(i32, 1), try splitWheel(t.allocator, "a\x1b[<65;1;1Mb", &rest));
+    try t.expectEqualStrings("ab", rest.items);
+}
+
+test "isNoise" {
+    const t = std.testing;
+    try t.expect(isNoise("\x1b[<35;10;5M\x1b[<35;11;5M"));
+    try t.expect(isNoise("\x1b[I"));
+    try t.expect(isNoise("\x1b[99;5:3u")); // Ctrl+C released
+    try t.expect(isNoise("\x1b[57442;5:3u\x1b[<35;1;1M")); // Ctrl released
+    try t.expect(isNoise("\x1b[57442;5u")); // Ctrl pressed alone
+    try t.expect(!isNoise("\x1b[99;5u"));
+    try t.expect(!isNoise("a"));
+    try t.expect(!isNoise("\x1b[A"));
+    try t.expect(!isNoise("\x1b"));
 }
 
 test "lastFocus finds focus reports glued to mouse motion" {

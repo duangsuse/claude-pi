@@ -23,8 +23,22 @@ pub const Dialog = struct {
     /// `eachRow`: buttons per row (owned; the last count repeats). Empty:
     /// all on one row. All ones: a list (full-width rows).
     layout: []u8 = &.{},
+    /// Where each button was last drawn, for mouse clicks (render fills it).
+    hits: std.ArrayListUnmanaged(Hit) = .{},
+    /// A toast the user has moved through with ←/→: Enter / Esc now go to
+    /// it instead of CC, until another key goes to CC.
+    engaged: bool = false,
+
+    pub const Hit = struct { y: u16, x0: u16, x1: u16, index: usize };
+
+    /// The button drawn at screen cell (x, y), 0-based.
+    pub fn buttonAt(self: *const Dialog, x: u16, y: u16) ?usize {
+        for (self.hits.items) |h| if (h.y == y and x >= h.x0 and x < h.x1) return h.index;
+        return null;
+    }
 
     fn deinit(self: *Dialog, a: std.mem.Allocator) void {
+        self.hits.deinit(a);
         a.free(self.title);
         a.free(self.body);
         a.free(self.footer);
@@ -103,8 +117,14 @@ pub const Overlay = struct {
     dialog: ?Dialog = null,
     /// Non-modal dialog (`timeout`): top-right, keys keep going to CC.
     toast: ?Dialog = null,
-    /// Clickable label in the top-right corner (the plugin list).
+    /// Clickable label in the top-right corner (the plugin list, or a
+    /// plugin's pi.notify(msg, 'snack')).
     badge: ?[]u8 = null,
+    /// Same, bottom-right ('snackRD').
+    badge_rd: ?[]u8 = null,
+    /// SGR parameters ("1;48;5;236") replacing each badge's default look.
+    badge_sgr: ?[]u8 = null,
+    badge_rd_sgr: ?[]u8 = null,
     menu: ?Menu = null,
     /// Row paints: replacement text for the row, may carry SGR; "" blanks it.
     paints: std.AutoArrayHashMapUnmanaged(u16, []u8) = .{},
@@ -112,14 +132,15 @@ pub const Overlay = struct {
     pub fn deinit(self: *Overlay) void {
         self.closeDialog();
         self.closeToast();
-        self.setBadge(null);
+        self.setBadge(null, null);
+        self.setBadgeRd(null, null);
         self.closeMenu();
         self.clearPaints();
         self.paints.deinit(self.allocator);
     }
 
     pub fn active(self: *const Overlay) bool {
-        return self.dialog != null or self.toast != null or self.badge != null or
+        return self.dialog != null or self.toast != null or self.badge != null or self.badge_rd != null or
             self.menu != null or self.paints.count() > 0;
     }
 
@@ -155,16 +176,28 @@ pub const Overlay = struct {
         if (self.toast) |d| if (d.id == id) return self.closeToast();
     }
 
-    /// Takes ownership of `text`.
-    pub fn setBadge(self: *Overlay, text: ?[]u8) void {
-        if (self.badge) |b| self.allocator.free(b);
-        self.badge = text;
+    /// Takes ownership of `text` and `sgr`.
+    pub fn setBadge(self: *Overlay, text: ?[]u8, sgr: ?[]u8) void {
+        replace(self.allocator, &self.badge, text);
+        replace(self.allocator, &self.badge_sgr, sgr);
     }
 
-    /// Whether screen cell (x, y) is on the badge.
-    pub fn badgeHit(self: *const Overlay, x: u16, y: u16, cols: u16) bool {
-        const b = self.badge orelse return false;
-        return y == 0 and x >= cols -| @as(u16, @intCast(width(b)));
+    /// Takes ownership of `text` and `sgr`.
+    pub fn setBadgeRd(self: *Overlay, text: ?[]u8, sgr: ?[]u8) void {
+        replace(self.allocator, &self.badge_rd, text);
+        replace(self.allocator, &self.badge_rd_sgr, sgr);
+    }
+
+    fn replace(a: std.mem.Allocator, slot: *?[]u8, v: ?[]u8) void {
+        if (slot.*) |old| a.free(old);
+        slot.* = v;
+    }
+
+    /// Whether screen cell (x, y) is on either badge.
+    pub fn badgeHit(self: *const Overlay, x: u16, y: u16, cols: u16, rows: u16) bool {
+        if (self.badge) |b| if (y == 0 and x >= cols -| @as(u16, @intCast(width(b)))) return true;
+        if (self.badge_rd) |b| if (y + 1 == rows and x >= cols -| @as(u16, @intCast(width(b)))) return true;
+        return false;
     }
 
     pub fn openMenu(self: *Overlay, m: Menu) void {
@@ -190,7 +223,7 @@ pub const Overlay = struct {
 
     /// Bytes painting everything at absolute positions. The caller restores
     /// CC's cursor and SGR afterwards.
-    pub fn render(self: *const Overlay, out: *std.ArrayList(u8), cols: u16, rows: u16) !void {
+    pub fn render(self: *Overlay, out: *std.ArrayList(u8), cols: u16, rows: u16) !void {
         const a = self.allocator;
         var it = self.paints.iterator();
         while (it.next()) |e| {
@@ -199,9 +232,11 @@ pub const Overlay = struct {
             try out.appendSlice(a, e.value_ptr.*);
             try out.appendSlice(a, reset);
         }
-        if (self.badge) |b| {
+        for ([_]?[]u8{ self.badge, self.badge_rd }, [_]?[]u8{ self.badge_sgr, self.badge_rd_sgr }, [_]u16{ 1, rows }) |badge, sgr, row| {
+            const b = badge orelse continue;
             const w: u16 = @intCast(@min(width(b), cols));
-            try out.print(a, "\x1b[1;{d}H" ++ reset ++ btn_on, .{cols - w + 1});
+            try out.print(a, "\x1b[{d};{d}H" ++ reset, .{ row, cols - w + 1 });
+            if (sgr) |p| try out.print(a, "\x1b[{s}m", .{p}) else try out.appendSlice(a, btn_on);
             try truncate(a, out, b, w);
             try out.appendSlice(a, reset);
         }
@@ -230,7 +265,7 @@ fn renderMenu(a: std.mem.Allocator, out: *std.ArrayList(u8), m: *const Menu, col
 
 const Placement = enum { center, top_right };
 
-fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *const Dialog, cols: u16, rows: u16, place: Placement) !void {
+fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *Dialog, cols: u16, rows: u16, place: Placement) !void {
     // Content lines: title, blank, body…, then buttons, footer.
     var lines: std.ArrayList(struct { text: []const u8, style: []const u8 }) = .{};
     defer lines.deinit(a);
@@ -277,6 +312,9 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *const Dialog,
         .top_right => 2, // under the badge row
     };
 
+    d.hits.clearRetainingCapacity();
+    // Content starts after "│ "; hits are 0-based screen cells.
+    const cx: usize = x0 + 1;
     var y = y0;
     try out.print(a, "\x1b[{d};{d}H" ++ reset ++ accent ++ "╭", .{ y, x0 });
     try repeat(a, out, "─", inner + 2);
@@ -300,6 +338,7 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *const Dialog,
             y += 1;
             try sideOpen(a, out, y, x0);
             if (list) {
+                try addHit(a, d, y, cx, inner, sp.start);
                 try out.appendSlice(a, if (sp.start == d.active) btn_on else btn_off);
                 try padded(a, out, d.buttons[sp.start], inner, 1);
             } else if (grid) {
@@ -316,6 +355,7 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *const Dialog,
                     const w = cell + @as(usize, if (spare > 0) 1 else 0);
                     spare -|= 1;
                     const lead = (w -| @min(width(b), w)) / 2;
+                    try addHit(a, d, y, cx + used, w, sp.start + j);
                     try out.appendSlice(a, if (sp.start + j == d.active) btn_on else btn_off);
                     try padded(a, out, b, w, lead);
                     try out.appendSlice(a, reset);
@@ -324,8 +364,14 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *const Dialog,
                 try repeat(a, out, " ", inner -| used);
             } else {
                 try repeat(a, out, " ", inner -| btn_w);
+                var at: usize = cx + (inner -| btn_w);
                 for (d.buttons[sp.start..][0..sp.len], 0..) |b, j| {
-                    if (j > 0) try out.appendSlice(a, "  ");
+                    if (j > 0) {
+                        try out.appendSlice(a, "  ");
+                        at += 2;
+                    }
+                    try addHit(a, d, y, at, width(b) + 2, sp.start + j);
+                    at += width(b) + 2;
                     try out.appendSlice(a, if (sp.start + j == d.active) btn_on else btn_off);
                     try padded(a, out, b, width(b) + 2, 1);
                     try out.appendSlice(a, reset);
@@ -345,6 +391,11 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *const Dialog,
     try out.print(a, "\x1b[{d};{d}H" ++ reset ++ accent ++ "╰", .{ y, x0 });
     try repeat(a, out, "─", inner + 2);
     try out.appendSlice(a, "╯" ++ reset);
+}
+
+/// `y` is the 1-based row being drawn, `x` the 0-based first cell.
+fn addHit(a: std.mem.Allocator, d: *Dialog, y: usize, x: usize, w: usize, index: usize) !void {
+    try d.hits.append(a, .{ .y = @intCast(y - 1), .x0 = @intCast(x), .x1 = @intCast(x + w), .index = index });
 }
 
 fn sideOpen(a: std.mem.Allocator, out: *std.ArrayList(u8), y: usize, x0: usize) !void {
@@ -484,6 +535,33 @@ test "row paints replace or blank rows" {
     try testing.expectEqualStrings("painted\n\ncccc\n", s);
 }
 
+test "buttonAt finds what render drew under a cell" {
+    var o: Overlay = .{ .allocator = testing.allocator };
+    defer o.deinit();
+    o.openDialog(testDialog(&.{ "OK", "Cancel" }));
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(testing.allocator);
+    try o.render(&out, 60, 24);
+    const g = try Grid.create(testing.allocator, 60, 24);
+    defer g.destroy(testing.allocator);
+    g.feed(out.items);
+    const s = try g.snapshot(testing.allocator);
+    defer testing.allocator.free(s);
+    var it = std.mem.splitScalar(u8, s, '\n');
+    var y: u16 = 0;
+    while (it.next()) |row| : (y += 1) {
+        const at = std.mem.indexOf(u8, row, "Cancel") orelse continue;
+        const x: u16 = @intCast(width(row[0..at]));
+        const d = &o.dialog.?;
+        try testing.expectEqual(@as(?usize, 1), d.buttonAt(x, y));
+        try testing.expectEqual(@as(?usize, 1), d.buttonAt(x + 6, y)); // trailing pad
+        try testing.expectEqual(@as(?usize, 0), d.buttonAt(x - 4, y)); // "OK "
+        try testing.expectEqual(@as(?usize, null), d.buttonAt(x, y + 1));
+        return;
+    }
+    return error.NoButtons;
+}
+
 test "vertical buttons, toast placement and the badge" {
     var o: Overlay = .{ .allocator = testing.allocator };
     defer o.deinit();
@@ -492,10 +570,10 @@ test "vertical buttons, toast placement and the badge" {
     o.openDialog(d);
     const t = testDialog(&.{});
     o.openToast(.{ .id = 9, .title = t.title, .body = t.body, .footer = t.footer, .buttons = t.buttons });
-    o.setBadge(try testing.allocator.dupe(u8, " plugins 2/2 "));
-    try testing.expect(o.badgeHit(59, 0, 60));
-    try testing.expect(!o.badgeHit(30, 0, 60));
-    try testing.expect(!o.badgeHit(59, 1, 60));
+    o.setBadge(try testing.allocator.dupe(u8, " plugins 2/2 "), null);
+    try testing.expect(o.badgeHit(59, 0, 60, 24));
+    try testing.expect(!o.badgeHit(30, 0, 60, 24));
+    try testing.expect(!o.badgeHit(59, 1, 60, 24));
     try testing.expect(o.findDialog(9) != null);
 
     var out: std.ArrayList(u8) = .{};

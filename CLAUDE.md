@@ -29,7 +29,9 @@ capturing the final assistant message via a `Stop` hook, and emitting it in
    goldens with `zig build update-fixtures` and review the diff carefully.
 4. **No global state mutation.** Never write to `~/.claude/` — with one
    user-requested exception: in interactive mode, quitting CC with Ctrl+C
-   deletes that session's transcript (`src/pi/convo.zig`, path-checked). All hook
+   moves that session's transcript to `~/claude/last` and prints the `mv`
+   that restores it (`src/pi/convo.zig`, path-checked; empty sessions are
+   left alone). All hook
    scripts, settings, FIFOs live under `$TMPDIR/claude-p-<pid>/` and are
    cleaned up on exit (including via signal-safe cleanup paths).
 5. **Vendored zmux.** `zmux` is pulled in via `zig fetch` and the
@@ -66,24 +68,25 @@ runs the real `claude` binary.
 | `src/transcript.zig` | Session JSONL parser. |
 | `src/emit.zig` | Output formatters. |
 | `tests/integration.zig` | Real-claude end-to-end tests (gated). |
-| `src/pi/main.zig` | Interactive mode (no args): raw passthrough, hook FIFO, `scr` dump. |
+| `src/pi/main.zig` | Interactive mode (no args): raw passthrough, hook FIFO, `scr` dump (only while the file exists; `scr` / `host.log` are deleted on exit), wheel-scroll overlay debounce. |
 | `src/pi/grid.zig` | ghostty-vt grid mirroring CC's screen. |
 | `src/pi/term.zig` | Raw mode, winsize, SIGWINCH self-pipe. |
 | `src/pi/sidecar.zig` | Spawns `js/host.js`, JSON-lines RPC. |
-| `src/pi/screen.zig` | **All** rules for reading CC's UI off the grid (input box, busy, …). |
+| `src/pi/screen.zig` | **All** rules for reading CC's UI off the grid (input box, busy, …). Glyphs / keywords are `screen.Rules` (CC's by default, `pi.arg` overrides for `cld-pi -a <tui>`). |
 | `src/pi/input.zig` | Pure key logic: Tab prefixes, Ctrl+C plan, path → cd target. |
 | `src/pi/steps.zig` | Non-blocking queue of pty writes + waits (cd flow). |
 | `src/pi/fzf.zig` | fzf on the real tty (main.zig pauses output, repaints from grid). |
 | `src/pi/overlay.zig` | Dialog / menu / row paints, appended after every CC chunk. |
-| `js/plugins/*.js` | Default plugins: `notify.js` (desktop notification), `herdry.js` (spinning tab title). |
+| `js/plugins/*.js` | Default plugins: `notify.js` (desktop notification), `herdry.js` (spinning tab title), `pace.js` (last ● duration + 3-minute cost, bottom-right snack). |
 | `js/rpc.js` | `pi` API + plugin registry (AsyncLocalStorage ownership, timer hooks, ◆ badge list). |
 | `js/session.js` | Transcript cost / name, status-line parsing (effort, mode), Bash output rows. Prices from the claude-api skill. |
 | `js/plugins/panel.js` | Ctrl+P panel: rows of buttons (`eachRow [4,5,3,3,4]`), relabeled via the dialog handle once CC agrees. |
 | `js/tab.js` | Tab-title backends (Yakuake / Konsole / Guake over D-Bus) for `pi.tui.title`. |
+| `js/plugins/f12.js`, `js/cdp.js` | P5: `//` tab screenshot, `//gh/` URLs (tabs + History), `pi.ext.f12.addTrust` → `~/.F12-mcp.json`, MCP install hint. `cdp.js` = stdlib CDP client + Chrome discovery (`CLAUDE_P_CDP` or `DevToolsActivePort`). Tests inject `home` / `cdp`: never let them touch the real `~/.F12-mcp.json` or the user's Chrome. |
 | `js/plugins/{add-dir,webpane,magpie}.js` | `/ad`, `/w` (+ `pi.ext.webpane`), `/m` (via `pi.sh`). Tests fake `pi`; don't run `/w` / `/m` for real in tests (npx server, desktop app). |
 | `goal-v1.ipynb` | `%%js` cell magic (stdlib CDP client, default :9229) + API examples. Agents test it against a sidecar on :9224. |
 | `src/pi/testdata/*.vt` | Raw CC output streams (100x30) replayed by screen/grid tests. |
-| `scripts/cc-probe.py` | Drive real CC through claude-p, record `.vt` + `scr` per step. |
+| `scripts/cc-probe.py` | Drive real CC through claude-p, record `.vt` + `scr` per step (it touches `scr` in its data dir to opt in). |
 | `scripts/vt-view.mjs` | Page through `.vt` files (←/→) by replaying them. |
 | `scripts/cdp-eval.mjs` | Evaluate JS in a sidecar over CDP (default :9224), like F12. |
 | `js/host.js`, `js/rpc.js` | node sidecar; plugin API grows here (see `goal-v1.ts`). |
@@ -92,8 +95,9 @@ runs the real `claude` binary.
 ## Agent testing (interactive mode)
 
 - The user may have a real claude-p running. **Agent tests use port 9224 for
-  every CDP endpoint** (sidecar inspector: `CLAUDE_P_INSPECT=9224`; the Chrome
-  remote-debugging port too, once P5 lands) and their own data dir
+  every CDP endpoint** (sidecar inspector: `CLAUDE_P_INSPECT=9224`; the browser
+  too: `CLAUDE_P_CDP=9224` + `chromium --remote-debugging-port=9224
+  --user-data-dir=<tmp>`, never the user's Chrome) and their own data dir
   (`CLAUDE_P_DIR=...`). `scripts/cc-probe.py` sets both.
 - `cc-probe.py` has no terminal emulator in front of it: it can't show what
   the user actually sees (fzf panels, repaints). For that run claude-p in

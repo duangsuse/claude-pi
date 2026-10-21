@@ -24,6 +24,17 @@ export function lineSplitter(onLine) {
 
 const dialogText = new Set(['title', 'body', 'footer'])
 
+/** SGR parameters for a snack background (see pi.notify); undefined: default. */
+export function snackSgr(bg) {
+  if (bg == null) return undefined
+  if (bg === 'none') return '2;38;5;212;49'
+  const hex = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(String(bg))
+  if (hex) return `1;38;5;230;48;2;${hex.slice(1).map(h => parseInt(h, 16)).join(';')}`
+  const n = Number(bg)
+  if (Number.isInteger(n) && n >= 0 && n < 256) return `1;38;5;230;48;5;${n}`
+  return undefined
+}
+
 /** Single-quote for a POSIX shell. */
 export const shQuote = v => `'${String(v).replace(/'/g, `'\\''`)}'`
 
@@ -36,7 +47,8 @@ export const shQuote = v => `'${String(v).replace(/'/g, `'\\''`)}'`
 export function createHost(send, log = () => {}, io = {}) {
   // focused: from the terminal's focus reports (CSI I / O). Starts true:
   // you just launched it from that terminal.
-  const state = { init: null, cols: 0, rows: 0, focused: true, scr: null }
+  // transcript: the session's JSONL, from the latest hook payload.
+  const state = { init: null, cols: 0, rows: 0, focused: true, scr: null, transcript: null }
 
   // ---- plugin ownership ----
   // Plugin code runs inside als.run(plugin): its setup, its listeners, its
@@ -162,10 +174,13 @@ export function createHost(send, log = () => {}, io = {}) {
 
   // pi.complete('//', tok => [...]): Tab on a word starting with the prefix
   // offers the returned strings in fzf; the pick replaces the word as-is.
-  const completers = new Map() // prefix -> { source, p }
+  // pi.complete('//', source, (item, tok) => text): the pick goes through
+  // that first (null / '' types nothing), e.g. a tab title → `@shot.png`.
+  const completers = new Map() // prefix -> { source, pick, p }
+  const picks = new Map() // complete id -> { pick, token, p }
   const syncCompleters = () => send({ t: 'completions', prefixes: [...completers.keys()] })
-  pi.complete = (prefix, source) => {
-    const entry = { source, p: owner() }
+  pi.complete = (prefix, source, pick) => {
+    const entry = { source, pick, p: owner() }
     completers.set(prefix, entry)
     syncCompleters()
     return track(() => {
@@ -174,7 +189,31 @@ export function createHost(send, log = () => {}, io = {}) {
     })
   }
 
-  pi.notify = msg => io.notify?.(String(msg))
+  // pi.notify(msg): desktop notification. pi.notify(msg, 'snack') puts msg
+  // where the ◆ plugins badge is (top-right), 'snackRD' bottom-right; both
+  // open the plugin list when clicked, '' takes the plugin's snack down.
+  // One snack per plugin and corner; the latest one shows. { bg }: its
+  // background, a 256-colour number, '#rrggbb', or 'none' (no background,
+  // dim text); default the badge's pink.
+  const snacks = { snack: new Map(), snackRD: new Map() } // owner -> { text, sgr }
+  pi.notify = (msg, where, { bg } = {}) => {
+    if (!(where in snacks)) return io.notify?.(String(msg))
+    const p = owner() ?? null
+    const slot = snacks[where]
+    slot.delete(p) // re-insert: the latest goes last
+    if (msg !== '' && msg != null) {
+      slot.set(p, { text: String(msg), sgr: snackSgr(bg) })
+      if (p && !p.snackDisposers?.has(where)) {
+        ;(p.snackDisposers ??= new Set()).add(where)
+        track(() => {
+          p.snackDisposers.delete(where)
+          snacks[where].delete(p)
+          updateBadge()
+        })
+      }
+    }
+    updateBadge()
+  }
 
   // pi.sh`cmd ${value}`: run a shell line; interpolated values are quoted,
   // so they can't inject. Resolves { code, stdout, stderr } when the shell
@@ -232,6 +271,7 @@ export function createHost(send, log = () => {}, io = {}) {
     const dlg = dialogs.get(id)
     if (!dlg) return
     dialogs.delete(id)
+    orig.clearTimeout(dlg.timer)
     send({ t: 'dialog_close', id })
     dlg.resolve(label)
   }
@@ -263,9 +303,15 @@ export function createHost(send, log = () => {}, io = {}) {
       send({ t: 'dialog_update', id, ...texts })
     }
     if (!modal) {
-      orig.setTimeout(async () => {
-        const dlg = dialogs.get(id)
-        if (!dlg) return
+      // Any interaction (←/→, a click or Enter that keeps it open) starts
+      // the timeout over.
+      const dlg = dialogs.get(id)
+      dlg.rearm = () => {
+        orig.clearTimeout(dlg.timer)
+        dlg.timer = orig.setTimeout(fire, d.timeout)
+      }
+      const fire = async () => {
+        if (dialogs.get(id) !== dlg) return
         const i = dlg.moved || dlg.labels.includes(d.or) ? dlg.active : -1
         if (i >= 0) {
           try {
@@ -275,13 +321,15 @@ export function createHost(send, log = () => {}, io = {}) {
           }
         }
         closeDialog(id, i >= 0 ? dlg.labels[i] : null)
-      }, d.timeout)
+      }
+      dlg.rearm()
     }
     return done
   }
   const pressButton = async ({ id, index }) => {
     const dlg = dialogs.get(id)
     if (!dlg) return
+    dlg.rearm?.()
     let r
     try {
       r = await inOwner(dlg.p, () => dlg.fns[index]?.())
@@ -291,6 +339,7 @@ export function createHost(send, log = () => {}, io = {}) {
     if (typeof r === 'string') {
       dlg.labels[index] = r
       send({ t: 'dialog_update', id, index, label: r })
+      dlg.rearm?.()
       return
     }
     closeDialog(id, dlg.labels[index])
@@ -396,9 +445,22 @@ export function createHost(send, log = () => {}, io = {}) {
     for (const h of p.timers) orig.clearTimeout(h)
     p.timers.clear()
   }
+  const lastSnack = slot => [...slot.values()].at(-1)
+  let shown = {}
   const updateBadge = () => {
     const on = [...plugins.values()].filter(p => p.enabled).length
-    send({ t: 'badge', text: ` ◆ plugins ${on}/${plugins.size} ` })
+    const top = lastSnack(snacks.snack)
+    const rd = lastSnack(snacks.snackRD)
+    const msgs = [
+      { t: 'badge', text: ` ${top?.text ?? `◆ plugins ${on}/${plugins.size}`} `, ...(top?.sgr && { sgr: top.sgr }) },
+      { t: 'badge', pos: 'rd', text: rd ? ` ${rd.text} ` : null, ...(rd?.sgr && { sgr: rd.sgr }) },
+    ]
+    for (const m of msgs) {
+      const key = m.pos ?? 'tr'
+      const json = JSON.stringify(m)
+      if (json !== (shown[key] ?? (key === 'rd' ? JSON.stringify({ t: 'badge', pos: 'rd', text: null }) : ''))) send(m)
+      shown[key] = json
+    }
   }
   const label = p => `${p.enabled ? '[x]' : '[ ]'} ${p.name}`
 
@@ -484,11 +546,15 @@ export function createHost(send, log = () => {}, io = {}) {
         emit('resize', msg)
         break
       case 'hook':
+        if (msg.payload?.transcript_path) state.transcript = msg.payload.transcript_path
         emit(hookNames[msg.event] ?? msg.event, msg.payload)
         break
       case 'focus':
         state.focused = msg.focused
         emit('focus', msg.focused)
+        break
+      case 'wheel':
+        emit('wheel', msg.dir)
         break
       case 'scr': {
         const scr = { rows: msg.rows, text: msg.rows.join('\n'), cursor: msg.cursor }
@@ -524,10 +590,28 @@ export function createHost(send, log = () => {}, io = {}) {
       }
       case 'complete': {
         const c = completers.get(msg.prefix)
+        picks.clear() // Zig waits on one Tab at a time; an fzf Esc never answers
         Promise.resolve()
           .then(() => (c ? inOwner(c.p, () => c.source(msg.token)) : []))
           .catch(e => (log(`completion ${msg.prefix} threw`, e), []))
-          .then(items => send({ t: 'complete_result', id: msg.id, items: (items ?? []).map(String) }))
+          .then(items => {
+            const reply = { t: 'complete_result', id: msg.id, items: (items ?? []).map(String) }
+            if (c?.pick && reply.items.length) {
+              reply.pick = true
+              picks.set(msg.id, { pick: c.pick, token: msg.token, p: c.p })
+            }
+            send(reply)
+          })
+        break
+      }
+      case 'picked': {
+        const k = picks.get(msg.id)
+        picks.delete(msg.id)
+        if (!k) break
+        Promise.resolve()
+          .then(() => inOwner(k.p, () => k.pick(msg.item, k.token)))
+          .catch(e => (log('completion pick threw', e), null))
+          .then(text => send({ t: 'pick_result', id: msg.id, text: text ? String(text) : null }))
         break
       }
       case 'dialog_button':
@@ -538,12 +622,14 @@ export function createHost(send, log = () => {}, io = {}) {
         if (!dlg) break
         dlg.active = msg.index
         dlg.moved = true
+        dlg.rearm?.()
         if (dlg.hints.some(h => h != null)) send({ t: 'dialog_update', id: msg.id, footer: dlg.hints[msg.index] ?? dlg.footer })
         break
       }
       case 'dialog_closed': {
         const dlg = dialogs.get(msg.id)
         dialogs.delete(msg.id)
+        if (dlg) orig.clearTimeout(dlg.timer)
         dlg?.resolve(null)
         break
       }

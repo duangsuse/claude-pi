@@ -32,12 +32,15 @@ def main():
     outdir, steps = os.path.abspath(args[0]), json.loads(args[1])
     data = os.path.join(outdir, 'data')
     os.makedirs(data, exist_ok=True)
+    open(os.path.join(data, 'scr'), 'a').close()  # opt in to the grid dump
     binp = os.path.join(ROOT, 'zig-out', 'bin', 'claude-p')
 
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(cwd)
-        env = dict(os.environ, CLAUDE_P_INSPECT='9224', CLAUDE_P_DIR=data)
+        # 9224 for every CDP endpoint: the sidecar's inspector and the browser
+        # f12.js talks to (never the user's Chrome).
+        env = dict(os.environ, CLAUDE_P_INSPECT='9224', CLAUDE_P_CDP='9224', CLAUDE_P_DIR=data)
         os.execve(binp, [binp], env)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS, 0, 0))
 

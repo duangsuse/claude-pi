@@ -12,6 +12,7 @@ interface Events {
 
   user(msg: string): void          // 用户提交了一条消息（P6）
   focus(focused: boolean): void    // 终端焦点变化（来自 CSI I / CSI O）
+  wheel(dir: -1 | 1): void         // 鼠标滚轮（-1 向上翻历史）
   scrcpy(s: Scr): void             // 每帧触发
   CtrlC(): void | false            // 返回 false 表示不再走默认行为（Zig 最多等 80ms 的回答；只有被监听的键才会问）
   [key: `Ctrl${string}` | `Shift${string}`]: (() => void | false) | undefined
@@ -39,7 +40,8 @@ type Dialog = {
   title?: string
   body?: string
   footer?: string
-  /** 非模态：显示在右上角，只借用 ←/→ 选按钮（其余键照常给 CC）；timeout 毫秒后按下选中的按钮
+  /** 非模态：显示在右上角，只借用 ←/→ 选按钮（其余键照常给 CC）；选过之后 Enter 按下、Esc 关闭，
+   *  直到有键交给 CC；按钮也可以鼠标点击。timeout 毫秒后按下选中的按钮，每次交互重新计时
    *  （初始选中 `or`；没有 or 且没动过则 resolve null） */
   timeout?: number
   or?: string
@@ -66,8 +68,13 @@ interface Pi {
 
   /** 注册伪命令 /name：单行 `/name a b` 回车时拦截（CC 看不到），run(['a','b']) */
   command(name: string, run: (args: string[]) => unknown): void
-  /** 注册前缀补全：Tab 时以该前缀开头的词交给 source，候选由 Zig 侧交给 fzf，选中项原样替换该词 */
-  complete(prefix: string, source: (tok: string) => Promise<string[]> | string[]): void
+  /** 注册前缀补全：Tab 时以该前缀开头的词交给 source，候选由 Zig 侧交给 fzf，选中项原样替换该词。
+   *  给了 pick 时选中项先交给它，替换成它返回的文字（null / '' 不输入），如标签页标题 → `@截图.png` */
+  complete(
+    prefix: string,
+    source: (tok: string) => Promise<string[]> | string[],
+    pick?: (item: string, tok: string) => Promise<string | null> | string | null,
+  ): void
 
 
   // P2：逐行处理网格。返回字符串就把这一行涂成该文本（'' 即涂掉）；返回 null 表示不改这一行
@@ -84,7 +91,9 @@ interface Pi {
    * 点在输入框箭头（❯）那一行及其下方的不算：输入框、状态栏的点击照常交给 CC。
    */
   click(handler: (i_row: number) => void): () => void
-  notify(msg: string): void        // notify-send（macOS 用 osascript）
+  /** notify-send（macOS 用 osascript）。'snack'：文字放到右上角角标（替换 ◆ plugins n/m），
+   *  'snackRD'：右下角；点进去仍是插件列表，'' 撤下。每个插件每个角一条，显示最新的 */
+  notify(msg: string, where?: 'snack' | 'snackRD', style?: { bg?: number | `#${string}` | 'none' }): void
   /** 跑一行 shell：插值的值会被单引号转义（防注入）；shell 退出即 resolve，长期运行的程序在行尾加 & */
   sh(strings: TemplateStringsArray, ...values: unknown[]): Promise<{ code: number; stdout: string; stderr: string }>
   /** 终端侧的辅助 */
@@ -97,8 +106,9 @@ interface Pi {
     dispose(fn: () => unknown): void
     /** 本终端的标签标题：Yakuake / Konsole / Guake 走 D-Bus，其他终端用窗口标题（OSC 2）；title(null) 恢复原标题 */
     title(text: string | null): Promise<void>
-    /** focused 来自终端的焦点上报，初始为 true；scr 是最近一帧网格（调用过 sed / wait 才每帧更新） */
-    state: { cols: number; rows: number; focused: boolean; scr: Scr | null }
+    /** focused 来自终端的焦点上报，初始为 true；scr 是最近一帧网格（调用过 sed / wait 才每帧更新）；
+     *  transcript 是最近一次 hook 给出的会话 JSONL 路径 */
+    state: { cols: number; rows: number; focused: boolean; scr: Scr | null; transcript: string | null }
   }
 
   // P6：消息边界和 scrollInView
@@ -109,7 +119,7 @@ interface Pi {
 
   /** 插件之间共享的扩展：核心只提供空对象，由同名插件发布（webpane.js → pi.ext.webpane，f12.js → pi.ext.f12） */
   ext: {
-    f12: { addTrust(allowedUrlPattern: string): Promise<void> }   // f12.js（P5）：追加到 ~/.F12-mcp.json
+    f12: { addTrust(allowedUrlPattern: string): Promise<void> }   // f12.js（P5）：追加到 ~/.F12-mcp.json（如 'https://github.com/*'）
     /** webpane.js：先检查端口，没被占用就返回该端口，否则返回 null；两种情况都会显示 dialog */
     webpane: { boundPort(port: number): Promise<number | null> }
   }
@@ -131,6 +141,10 @@ export default (pi: Pi) => {
   pi.click(i_row => {})
   pi.BUFFER = '草稿，不回车'
   pi.arg.fzf = "--pointer '▶' --height=60%"
+  pi.arg.whlSpeed = '0'          // 默认 '0' 透传；n：几格滚轮算一次 PgUp / PgDn
+  // 界面识别（cld-pi -a 套别的 TUI 时改；默认是 CC 的硬编码）：输入框边框字符、提示符、bash 模式提示符、忙碌 / 命令运行中的关键字
+  pi.arg.border = '─'; pi.arg.prompt = '❯'; pi.arg.bash = '!'; pi.arg.busy = 'esc to interrupt'; pi.arg.running = 'Running…'
+  pi.notify('● 2.1s · 3m $0.12', 'snackRD')
   pi.notify('done')
 
   // P2

@@ -1,8 +1,9 @@
 // node sidecar spawned by `claude-p` in interactive mode. Speaks JSON lines
 // on stdio (see src/pi/sidecar.zig). stderr is discarded by the binary, so
-// everything diagnostic goes to ~/claude/-p/host.log.
+// everything diagnostic goes to ~/claude/-p/host.log -- only while that file
+// exists (touch it to turn logging on; claude-p removes it on exit).
 import { spawn } from 'node:child_process'
-import { appendFileSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import inspector from 'node:inspector'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -16,7 +17,7 @@ const logFile = join(dataDir, 'host.log')
 const log = (...a) => {
   const line = a.map(x => (x instanceof Error ? x.stack : typeof x === 'string' ? x : JSON.stringify(x))).join(' ')
   try {
-    appendFileSync(logFile, `${new Date().toISOString()} ${line}\n`)
+    if (existsSync(logFile)) appendFileSync(logFile, `${new Date().toISOString()} ${line}\n`)
   } catch {}
 }
 

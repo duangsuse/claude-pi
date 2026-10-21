@@ -20,6 +20,7 @@ npx cld-pi -r [id]                       # 交互模式，恢复会话（-c：�
 npx cld-pi "解释一下这个仓库"              # 输出与 `claude -p` 一致
 npx cld-pi .json "总结" < diff.txt        # .text / .json / .stream-json 即 --output-format
 npx cld-pi -r <id> "接着呢？"              # 在已有会话里以 -p 模式提问
+npx cld-pi -a codex                      # 套别的 TUI（用 pi.arg.prompt / busy / … 描述它的界面）
 ```
 
 需要 `$PATH` 里有 `claude`、Node ≥ 18，支持 macOS 和 Linux。
@@ -34,12 +35,14 @@ rc 文件。
 
 | 文件 | 说明 |
 |---|---|
-| `scr` | 当前屏幕的纯文本快照，每帧刷新 |
-| `host.log` | node sidecar 的日志 |
+| `scr` | 当前屏幕的纯文本快照，每帧刷新；只在文件存在时写（`touch` 一下开启，退出时删除） |
+| `host.log` | node sidecar 的日志；同样存在才写，退出时删除 |
 | `inspect` | sidecar 的 DevTools 地址 |
 | `*.js` | 你的插件：`export default pi => { … }`（ES module） |
 
-右上角的 `◆ plugins n/m` 角标列出所有插件，点它可以关掉某个插件——它注册的监听、`pi.sed` 和定时器会一起撤掉。
+右上角的 `◆ plugins n/m` 角标列出所有插件，点它可以关掉某个插件——它注册的监听、`pi.sed` 和定时器会一起撤掉。插件可以用
+`pi.notify(msg, 'snack')` 把自己的文字放到这个位置（右下角用 `'snackRD'`）；默认插件 `pace`
+在右下角显示上一条 ● 的耗时和近 3 分钟的花费。两个角点进去都是插件列表。
 
 ## 按键
 
@@ -47,8 +50,12 @@ rc 文件。
 |---|---|
 | `./…` + Tab | 用 fzf 选 CC 当前目录下的文件 → 插入 `@路径 `（ctrl-d：选该文件所在文件夹） |
 | `/~/…` + Tab | 同上，范围是 `~` |
+| `//…` + Tab | 用 fzf 选 Chrome 标签页 → 截图，插入 `@/tmp/….png ` |
+| `//gh/…` + Tab | 补全该站点（`gh` → github.com）的 URL，来源是标签页和 Chrome 历史 |
 | Ctrl+C | 清掉光标所在行及下面的行，光标停在新的空行；输入框为空时交给 Claude Code 自己处理 |
-| 用 Ctrl+C 退出 | **删除这次对话**（`~/.claude/projects/` 下的记录）；想保留就用 `/exit` 退出 |
+| 用 Ctrl+C 退出 | 把这次对话从 `~/.claude/projects/` 移到 `~/claude/last`（覆盖上一次的），并打印 `To restore #> mv ~/claude/last …`；空会话不输出；想保留就用 `/exit` 退出 |
+| 鼠标滚轮 | 原样交给 Claude Code，滚动时叠加层让开，停下再画回来（`pi.arg.whlSpeed = n`：改成 n 格一次 PgUp / PgDn） |
+| 双击 | 顺着上次滚轮的方向翻一页（PgUp / PgDn） |
 | Ctrl+Enter | 粘贴剪贴板并提交（终端需支持 kitty 键盘协议或 modifyOtherKeys） |
 | Ctrl+P | 设置面板：会话名和花费、model / effort / mode、file / web 权限、隐藏 Bash 输出、CtrlO / CtrlR / Undo / Copy |
 | 单行输入 `/~/名字` 后回车 | 创建 `~/claude/名字`，并把 `cd … && npx cld-pi` 复制到剪贴板，在新终端粘贴即可打开 |
@@ -60,8 +67,22 @@ rc 文件。
 | 命令 | |
 |---|---|
 | `/ad <目录>` | `/add-dir`（自动确认对话框），然后 `!tree -L 2 <目录>` |
-| `/w` | `:3001` 上的 cloudcli Web UI（没有服务就在后台启动），列出 localhost / 局域网 / tailscale 地址 |
+| `/w` | `:3001` 上的 cloudcli Web UI（没有服务就在后台启动），列出 localhost / 局域网 / tailscale 地址；三个按钮：复制局域网地址、复制 tailscale 地址、显示 tailscale 地址的二维码（`npx qrcode-terminal`） |
 | `/m` | `~/.local/bin/magpie panel` |
+
+## Chrome
+
+`//` 需要 Chrome 打开远程调试：访问 `chrome://inspect/#remote-debugging` 并允许
+（Chrome 144+；每次会话 Chrome 会让你点一次 *Allow*）。用 `//` 或 `//gh/` 选过的站点
+会追加到 `~/.F12-mcp.json` 的 `allowedUrlPattern`，这是 chrome-devtools MCP 的配置，
+Claude 通过它操作同一个浏览器。第一次用 `//` 时会提示安装命令：
+
+```sh
+claude mcp add chrome-devtools --scope user -- npx -y chrome-devtools-mcp@latest \
+  --autoConnect --config ~/.F12-mcp.json --watchConfig
+```
+
+`CLAUDE_P_CDP=9222`（端口或 `ws://` URL）改连别的浏览器。
 
 ## 插件
 
@@ -90,8 +111,12 @@ pi.BUFFER = 'draft'  // replace the input box text, no Enter (write-only)
 pi.BUFFER=await pi.menu('abc'.split(''))
 
 pi.arg.fzf = "--pointer '▶' --height=60%"   // fzf options for Tab completion
+pi.arg.whlSpeed = 5                          // 几格滚轮算一次 PgUp / PgDn（0：透传）
+pi.arg.prompt = '>'   // 还有 border、bash、busy、running：怎样识别 TUI 的界面（默认是 CC 的）
+pi.notify('3 tests left', 'snack')           // 显示在右上角角标（'' 撤下）
+pi.notify('busy', 'snackRD', { bg: 236 })    // 右下角；bg：0-255、'#rrggbb'、'none'（透明）
 await pi.dialog({ title: 'Hi', body: 'gum-style', OK: () => {}, Stat: () => pi`/status` })
-pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // 非模态，显示在右上角
+pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // 非模态，显示在右上角；←/→、点击、Enter 都会重新计时
 pi.sed(ln => ln.includes('secret') ? '' : null)   // blank / rewrite screen rows
 await pi.on.stop      // wait for the next Stop hook
 ```
@@ -107,7 +132,7 @@ await pi.on.stop      // wait for the next Stop hook
 | P2 | 叠加层（菜单 / dialog / 涂抹）、Ctrl+Enter、`notify-send` | ✅ 完成 |
 | P3 | 插件 API，`/m` `/w` `/ad` | ✅ 完成 |
 | P4 | Ctrl+P 设置面板 | ✅ 完成 |
-| P5 | Chrome 标签页：`//` 截图、`//gh/` 补全 URL、WebMCP | |
+| P5 | Chrome 标签页：`//` 截图、`//gh/` 补全 URL、WebMCP | ✅ 完成 |
 | P6 | 会话目录 WebUI | |
 
 完整设计见 [goal-v1.md](./goal-v1.md)，插件 API 草案见 [goal-v1.ts](./goal-v1.ts)。

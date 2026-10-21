@@ -270,6 +270,31 @@ test('commands, completions and key hooks: registered with Zig, dropped with the
   assert.deepEqual(sent.findLast(m => m.t === 'keys'), { t: 'keys', names: [] })
 })
 
+test('pi.complete with a pick: Zig sends the chosen line back, the text it gets is typed', async () => {
+  const sent = []
+  const host = createHost(m => sent.push(m))
+  await host.loadPlugin('shot.js', pi => {
+    pi.complete('//', () => ['a — x.com', 'b — y.com'], async (item, tok) => (item.startsWith('a') ? `@/tmp/a.png#${tok}` : null))
+    pi.complete('#', () => ['#x'])
+  })
+  host.dispatch({ t: 'complete', id: 3, prefix: '//', token: '//x' })
+  host.dispatch({ t: 'complete', id: 4, prefix: '#', token: '#' })
+  await tick(5)
+  assert.deepEqual(sent.find(m => m.id === 3), { t: 'complete_result', id: 3, items: ['a — x.com', 'b — y.com'], pick: true })
+  assert.deepEqual(sent.find(m => m.id === 4), { t: 'complete_result', id: 4, items: ['#x'] })
+
+  host.dispatch({ t: 'complete', id: 5, prefix: '//', token: '//' })
+  await tick(5)
+  host.dispatch({ t: 'picked', id: 5, item: 'a — x.com' })
+  await tick(5)
+  assert.deepEqual(sent.at(-1), { t: 'pick_result', id: 5, text: '@/tmp/a.png#//' })
+  host.dispatch({ t: 'complete', id: 6, prefix: '//', token: '//' })
+  await tick(5)
+  host.dispatch({ t: 'picked', id: 6, item: 'b — y.com' })
+  await tick(5)
+  assert.deepEqual(sent.at(-1), { t: 'pick_result', id: 6, text: null })
+})
+
 test('pi.tui.wait matches text or a predicate, times out with false; press sends a key', async () => {
   const sent = []
   const { pi, dispatch } = createHost(m => sent.push(m))
@@ -334,4 +359,51 @@ test('sed callbacks get the row index and all rows', () => {
   pi.sed((ln, i, rows) => (i > 0 && rows[i - 1] === 'hide next' ? '' : null))
   dispatch({ t: 'scr', rows: ['hide next', 'secret', 'ok'], cursor: { row: 0, col: 0 } })
   assert.deepEqual(sent.at(-1), { t: 'paint', rows: [[1, '']] })
+})
+
+test('pi.notify snack / snackRD take the badge corners; off with the plugin', async () => {
+  const sent = []
+  const host = createHost(m => sent.push(m))
+  await host.loadPlugin('s.js', pi => {
+    pi.notify('● 1.0s', 'snack')
+    pi.notify('3m $0.10', 'snackRD')
+  })
+  const badges = () => sent.filter(m => m.t === 'badge')
+  assert.deepEqual(badges().findLast(m => !m.pos), { t: 'badge', text: ' ● 1.0s ' })
+  assert.deepEqual(badges().findLast(m => m.pos), { t: 'badge', pos: 'rd', text: ' 3m $0.10 ' })
+  host.pi.notify('', 'snack') // not the plugin's snack: no owner, nothing to drop
+  await host.setEnabled('s.js', false)
+  assert.deepEqual(badges().findLast(m => !m.pos), { t: 'badge', text: ' ◆ plugins 0/1 ' })
+  assert.deepEqual(badges().findLast(m => m.pos), { t: 'badge', pos: 'rd', text: null })
+})
+
+test('toast: ←/→ restarts the timeout', async () => {
+  const host = createHost(() => {})
+  let pressed = null
+  const r = host.pi.dialog({ body: 'b', timeout: 40, or: 'A', A: () => (pressed = 'A'), B: () => (pressed = 'B') })
+  await tick(25)
+  host.dispatch({ t: 'dialog_active', id: 1, index: 1 })
+  await tick(25)
+  assert.equal(pressed, null) // 50 ms in, but re-armed at 25
+  assert.equal(await r, 'B')
+})
+
+test('snack bg: 256-colour, #hex, none; bad values fall back to the default', async () => {
+  const { snackSgr } = await import('../rpc.js')
+  assert.equal(snackSgr(236), '1;38;5;230;48;5;236')
+  assert.equal(snackSgr('#102030'), '1;38;5;230;48;2;16;32;48')
+  assert.equal(snackSgr('none'), '2;38;5;212;49')
+  assert.equal(snackSgr('red;5'), undefined)
+  const sent = []
+  const host = createHost(m => sent.push(m))
+  await host.loadPlugin('s.js', pi => pi.notify('x', 'snackRD', { bg: 'none' }))
+  assert.deepEqual(sent.findLast(m => m.pos), { t: 'badge', pos: 'rd', text: ' x ', sgr: '2;38;5;212;49' })
+})
+
+test('wheel reports reach pi.on({ wheel })', () => {
+  const host = createHost(() => {})
+  const dirs = []
+  host.pi.on({ wheel: d => dirs.push(d) })
+  host.dispatch({ t: 'wheel', dir: -1 })
+  assert.deepEqual(dirs, [-1])
 })

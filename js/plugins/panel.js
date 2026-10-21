@@ -40,14 +40,8 @@ const actions = ['CtrlO', 'CtrlR', 'Undo', 'Copy']
 
 export default pi => {
   const { tui } = pi
-  let transcript = null
   let hideBash = null // disposer of the sed that blanks Bash output
   let open = false
-
-  const track = p => {
-    if (p?.transcript_path) transcript = p.transcript_path
-  }
-  pi.on({ sessionStart: track, stop: track, notification: track })
 
   // A fresh frame: waiting subscribes to frames, and Zig dumps one at once.
   const screen = async () => {
@@ -67,7 +61,7 @@ export default pi => {
     const text = await screen()
     let sum = { cost: 0, unpriced: 0, name: null, model: null }
     try {
-      if (transcript) sum = summarizeTranscript(readFileSync(transcript, 'utf8'))
+      if (tui.state.transcript) sum = summarizeTranscript(readFileSync(tui.state.transcript, 'utf8'))
     } catch {}
     const path = settingsPath()
     const cur = { model: modelFamily(sum.model), effort: effortOf(text), mode: modeOf(text) }

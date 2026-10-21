@@ -1,7 +1,8 @@
 //! Interactive mode: `claude-p` with no arguments. Wraps the real `claude`
 //! TUI (forced to `/tui fullscreen`) in a raw-mode passthrough. Every byte
 //! CC draws goes to the real terminal unmodified and into a ghostty-vt grid
-//! mirror; the grid is dumped to ~/claude/-p/scr as plain text each frame.
+//! mirror; the grid is dumped to ~/claude/-p/scr as plain text each frame
+//! while that file exists (opt-in: touch it; removed on exit).
 //!
 //! Keys go straight to the pty except the few `Keys` intercepts (Tab prefix
 //! completion, Ctrl+C partial clear, Enter on a bare path); the real
@@ -35,6 +36,21 @@ const stdout_fd: posix.fd_t = 1;
 /// while streaming; the file is for debugging and plugins, not a recorder.
 const scr_interval_ns: i64 = 30 * std.time.ns_per_ms;
 
+/// While the wheel scrolls (a wheel report less than `wheel_window_ns` ago),
+/// the TUI shows through untouched: its frames go out bare, and non-modal
+/// overlays (badge, toast, paints) come back once the wheel has stopped
+/// and output has been quiet for `overlay_settle_ns`.
+const wheel_window_ns: i64 = 150 * std.time.ns_per_ms;
+const overlay_settle_ns: i64 = 40 * std.time.ns_per_ms;
+/// Wheel notches per PgUp / PgDn (pi.arg.whlSpeed; 0, the default: the
+/// wheel goes to the TUI as is), and the pause after which a partial count
+/// is dropped.
+const default_wheel_speed: u32 = 0;
+const wheel_reset_ns: i64 = 500 * std.time.ns_per_ms;
+/// Two plain left clicks this close (time, cells) page the way the wheel
+/// last went.
+const double_click_ns: i64 = 400 * std.time.ns_per_ms;
+
 const hook_events = [_][]const u8{ "Notification", "Stop", "SessionStart" };
 
 /// CC exiting within this long after a forwarded Ctrl+C counts as "quit
@@ -60,6 +76,10 @@ const Shared = struct {
     paused: bool = false,
     last_output_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Last wheel report from the user (see wheel_window_ns).
+    wheel_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    /// A frame went out without the overlays on top (mutex held to touch).
+    overlay_stale: bool = false,
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     exit_code: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
@@ -68,6 +88,12 @@ const Shared = struct {
     /// in one synchronized write, so no frame ever shows CC without it.
     fn emit(self: *Shared, data: []const u8) void {
         if (!self.overlay.active()) return term.writeAll(stdout_fd, data);
+        const modal = self.overlay.dialog != null or self.overlay.menu != null;
+        if (!modal and @as(i64, @intCast(std.time.nanoTimestamp())) - self.wheel_ns.load(.seq_cst) < wheel_window_ns) {
+            self.overlay_stale = true;
+            return term.writeAll(stdout_fd, data);
+        }
+        self.overlay_stale = false;
         var out: std.ArrayList(u8) = .{};
         defer out.deinit(self.allocator);
         self.composeFrame(&out, data, false) catch return term.writeAll(stdout_fd, data);
@@ -184,6 +210,22 @@ const Keys = struct {
     /// `pi.arg.fzf` (owned once a plugin sets it).
     fzf_args: []const u8 = fzf.default_args,
     fzf_args_owned: bool = false,
+    /// How the TUI's parts look (pi.arg.border / prompt / bash / busy /
+    /// running); CC's by default.
+    rules: screen.Rules = .{},
+    /// `pi.arg.whlSpeed`: this many wheel notches make one PgUp / PgDn; 0
+    /// passes the wheel through.
+    wheel_speed: u32 = default_wheel_speed,
+    wheel_acc: i32 = 0,
+    wheel_last_ns: i64 = 0,
+    /// Way the wheel last went: -1 up (history), 1 down.
+    wheel_dir: i32 = -1,
+    /// The last plain left click (for double clicks), and whether the
+    /// release of a click we turned into a page is still to be swallowed.
+    click: ?struct { ns: i64, x: u16, y: u16 } = null,
+    swallow_release: bool = false,
+    /// Strings pi.arg handed us (rules point into them), freed at exit.
+    arg_store: std.ArrayList([]u8) = .{},
 
     fn init(allocator: std.mem.Allocator, shared: *Shared, session: *zmux.NativeSession) !Keys {
         const root = try std.process.getCwdAlloc(allocator);
@@ -210,6 +252,52 @@ const Keys = struct {
         }
         if (self.pending) |p| self.allocator.free(p.token);
         if (self.fzf_args_owned) self.allocator.free(self.fzf_args);
+        for (self.arg_store.items) |x| self.allocator.free(x);
+        self.arg_store.deinit(self.allocator);
+    }
+
+    /// pi.arg.k = v. Glyph rules take the first character; an empty value
+    /// leaves the rule as it was.
+    fn setArg(self: *Keys, k: []const u8, v: []const u8) void {
+        const eql = std.mem.eql;
+        if (eql(u8, k, "fzf")) return self.setFzfArgs(v);
+        if (eql(u8, k, "whlSpeed")) {
+            self.wheel_speed = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch return;
+            self.wheel_acc = 0;
+            return;
+        }
+        if (v.len == 0) return;
+        const glyph: ?*u21 = if (eql(u8, k, "border")) &self.rules.border else if (eql(u8, k, "prompt")) &self.rules.prompt else if (eql(u8, k, "bash")) &self.rules.bash else null;
+        if (glyph) |g| {
+            const n = std.unicode.utf8ByteSequenceLength(v[0]) catch return;
+            if (n > v.len) return;
+            g.* = std.unicode.utf8Decode(v[0..n]) catch return;
+            return;
+        }
+        const text: ?*[]const u8 = if (eql(u8, k, "busy")) &self.rules.busy else if (eql(u8, k, "running")) &self.rules.running else null;
+        if (text) |t| {
+            const copy = self.allocator.dupe(u8, v) catch return;
+            self.arg_store.append(self.allocator, copy) catch return self.allocator.free(copy);
+            t.* = copy;
+        }
+    }
+
+    /// Wheel reports in a stdin chunk (no modal overlay up): every
+    /// `wheel_speed` notches one way send one PgUp / PgDn; the rest of the
+    /// chunk goes to the TUI as is. A pause or a change of direction starts
+    /// the count over.
+    fn onWheel(self: *Keys, bytes: []const u8) void {
+        var rest: std.ArrayList(u8) = .{};
+        defer rest.deinit(self.allocator);
+        const net = input.splitWheel(self.allocator, bytes, &rest) catch return self.write(bytes);
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+        if (now - self.wheel_last_ns > wheel_reset_ns or (net < 0) != (self.wheel_acc < 0)) self.wheel_acc = 0;
+        self.wheel_last_ns = now;
+        self.wheel_acc += net;
+        const speed: i32 = @intCast(self.wheel_speed);
+        while (self.wheel_acc <= -speed) : (self.wheel_acc += speed) rest.appendSlice(self.allocator, "\x1b[5~") catch {};
+        while (self.wheel_acc >= speed) : (self.wheel_acc -= speed) rest.appendSlice(self.allocator, "\x1b[6~") catch {};
+        if (rest.items.len > 0) self.write(rest.items);
     }
 
     fn setFzfArgs(self: *Keys, args: []const u8) void {
@@ -234,7 +322,7 @@ const Keys = struct {
     fn box(self: *Keys) ?screen.Box {
         self.shared.mutex.lock();
         defer self.shared.mutex.unlock();
-        return screen.inputBox(self.allocator, &self.shared.grid.term) catch null;
+        return screen.inputBoxWith(self.allocator, &self.shared.grid.term, &self.rules) catch null;
     }
 
     fn send(self: *Keys, value: anytype) void {
@@ -262,29 +350,17 @@ const Keys = struct {
         if (input.hookName(key, &name_buf)) |name| {
             if (inList(self.hooked.items, name) and self.askKey(name)) return true;
         }
-        // A top-right (non-modal) dialog borrows ←/→ while it's up, to pick
-        // the button its timeout will press.
-        if (key == .left or key == .right) {
-            self.shared.mutex.lock();
-            const moved = if (self.shared.overlay.toast) |*t| blk: {
-                if (t.buttons.len < 2) break :blk false;
-                t.move(if (key == .left) .prev else .next);
-                self.shared.paintOverlay();
-                self.send(.{ .t = "dialog_active", .id = t.id, .index = t.active });
-                break :blk true;
-            } else false;
-            self.shared.mutex.unlock();
-            if (moved) return true;
-        }
+        if (self.onToastKey(key, bytes)) return true;
         if (key == .mouse and key.mouse.press and key.mouse.button == 0) {
             self.shared.mutex.lock();
-            const hit = self.shared.overlay.badgeHit(key.mouse.x, key.mouse.y, self.shared.grid.term.cols);
+            const hit = self.shared.overlay.badgeHit(key.mouse.x, key.mouse.y, self.shared.grid.term.cols, self.shared.grid.term.rows);
             self.shared.mutex.unlock();
             if (hit) {
                 self.send(.{ .t = "badge_click" });
                 return true;
             }
         }
+        if (self.onDoubleClick(key)) return true;
         if (self.runner.active()) return false;
         return switch (key) {
             .tab => self.onTab(),
@@ -293,6 +369,70 @@ const Keys = struct {
             .ctrl_enter => self.onCtrlEnter(),
             else => false,
         };
+    }
+
+    /// A plain double click (left button, no modifiers) pages the way the
+    /// wheel last went: the first click goes to the TUI, the second press
+    /// and its release become PgUp / PgDn.
+    fn onDoubleClick(self: *Keys, key: input.Key) bool {
+        if (key != .mouse or key.mouse.button != 0) return false;
+        const m = key.mouse;
+        if (!m.press) {
+            if (!self.swallow_release) return false;
+            self.swallow_release = false;
+            return true;
+        }
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+        if (self.click) |c| if (now - c.ns < double_click_ns and @max(c.x, m.x) - @min(c.x, m.x) <= 1 and c.y == m.y) {
+            self.click = null;
+            self.swallow_release = true;
+            self.write(if (self.wheel_dir < 0) "\x1b[5~" else "\x1b[6~");
+            return true;
+        };
+        self.click = .{ .ns = now, .x = m.x, .y = m.y };
+        return false;
+    }
+
+    /// A top-right (non-modal) dialog borrows ←/→ while it's up, to pick
+    /// the button its timeout will press; after that Enter presses it and
+    /// Esc dismisses it, until a key goes to the TUI. Its buttons can also
+    /// be clicked. Each of these tells the sidecar, which restarts the
+    /// timeout.
+    fn onToastKey(self: *Keys, key: input.Key, bytes: []const u8) bool {
+        const sh = self.shared;
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        const t = &(sh.overlay.toast orelse return false);
+        switch (key) {
+            .left, .right => {
+                if (t.buttons.len < 2) return false;
+                t.move(if (key == .left) .prev else .next);
+                t.engaged = true;
+                sh.paintOverlay();
+                self.send(.{ .t = "dialog_active", .id = t.id, .index = t.active });
+                return true;
+            },
+            .enter => if (t.engaged and t.buttons.len > 0) {
+                self.send(.{ .t = "dialog_button", .id = t.id, .index = t.active });
+                return true;
+            },
+            .esc => if (t.engaged) {
+                const id = t.id;
+                sh.overlay.closeToast();
+                sh.repaint();
+                self.send(.{ .t = "dialog_closed", .id = id });
+                return true;
+            },
+            .mouse => |m| if (m.press and m.button == 0) if (t.buttonAt(m.x, m.y)) |i| {
+                t.active = i;
+                sh.paintOverlay();
+                self.send(.{ .t = "dialog_button", .id = t.id, .index = i });
+                return true;
+            },
+            else => {},
+        }
+        if (!input.isNoise(bytes)) t.engaged = false;
+        return false;
     }
 
     /// A plugin hooked this key: ask the sidecar (briefly blocking) whether
@@ -334,6 +474,14 @@ const Keys = struct {
             d.move(dir);
             sh.paintOverlay();
             self.send(.{ .t = "dialog_active", .id = d.id, .index = d.active });
+            return true;
+        }
+        if (key == .mouse and key.mouse.press and key.mouse.button == 0) {
+            if (d.buttonAt(key.mouse.x, key.mouse.y)) |i| {
+                d.active = i;
+                sh.paintOverlay();
+                self.send(.{ .t = "dialog_button", .id = d.id, .index = i });
+            }
             return true;
         }
         switch (key) {
@@ -446,20 +594,43 @@ const Keys = struct {
 
     /// The plugin's candidates for a pending Tab: pick one in fzf and type
     /// it in place of the token (as-is: the plugin decides `@…`, URLs, …).
-    fn finishCompletion(self: *Keys, id: u32, items: []const []const u8) void {
+    /// `pick`: the plugin turns the chosen line into the text first (a tab
+    /// title into a screenshot's `@path`); the token waits for finishPick.
+    fn finishCompletion(self: *Keys, id: u32, items: []const []const u8, pick: bool) void {
         const p = self.pending orelse return;
         if (p.id != id) return;
         self.pending = null;
-        defer self.allocator.free(p.token);
+        var keep = false;
+        defer if (!keep) self.allocator.free(p.token);
         if (items.len == 0) return;
         self.pauseOutput();
         const picked = fzf.pickLine(self.allocator, items, p.token[p.prefix_len..], self.fzf_args) catch null;
         defer if (picked) |x| self.allocator.free(x);
         self.resumeOutput();
         const choice = picked orelse return;
+        if (pick) {
+            keep = true;
+            self.pending = p;
+            self.send(.{ .t = "picked", .id = id, .item = choice });
+            return;
+        }
+        self.typeCompletion(p.token, choice);
+    }
+
+    /// The plugin's text for a picked line; null / "" types nothing.
+    fn finishPick(self: *Keys, id: u32, text: ?[]const u8) void {
+        const p = self.pending orelse return;
+        if (p.id != id) return;
+        self.pending = null;
+        defer self.allocator.free(p.token);
+        const t = text orelse return;
+        if (t.len > 0) self.typeCompletion(p.token, t);
+    }
+
+    fn typeCompletion(self: *Keys, token: []const u8, choice: []const u8) void {
         const text = std.fmt.allocPrint(self.allocator, "{s} ", .{choice}) catch return;
         defer self.allocator.free(text);
-        self.replaceToken(p.token, text);
+        self.replaceToken(token, text);
     }
 
     /// Backspace over `tok` (just left of the caret) and type `with`.
@@ -604,13 +775,13 @@ const Keys = struct {
     pub fn busy(self: *Keys) bool {
         self.shared.mutex.lock();
         defer self.shared.mutex.unlock();
-        return screen.isBusy(self.allocator, &self.shared.grid.term);
+        return screen.isBusy(self.allocator, &self.shared.grid.term, &self.rules);
     }
 
     pub fn commandRunning(self: *Keys) bool {
         self.shared.mutex.lock();
         defer self.shared.mutex.unlock();
-        return screen.commandRunning(self.allocator, &self.shared.grid.term);
+        return screen.commandRunning(self.allocator, &self.shared.grid.term, &self.rules);
     }
 
     pub fn done(self: *Keys, id: u32) void {
@@ -671,20 +842,24 @@ fn readClipboard(allocator: std.mem.Allocator) ?[]u8 {
 ///   {"t":"submit","data":s}  pi`s`: replace the box text with s + Enter
 ///   {"t":"buffer","data":s}  pi.BUFFER = s: replace the input box text
 ///   {"t":"write","data":s}   raw bytes to the pty
-///   {"t":"arg","key":k,"value":v}  pi.arg.k = v (k: fzf)
+///   {"t":"arg","key":k,"value":v}  pi.arg.k = v (fzf, whlSpeed, border,
+///        prompt, bash, busy, running)
 ///   {"t":"dialog","id","title","body","footer","buttons":[..],"modal","eachRow"}
 ///        pi.dialog; modal:false (timeout set) is drawn top-right and leaves
 ///        the keyboard to CC
 ///   {"t":"dialog_update","id","index"?,"label"?,"title"?,"body"?,"footer"?}
 ///        relabel a button (callback returned a string) and/or replace texts
 ///   {"t":"dialog_close","id"}
-///   {"t":"badge","text":s|null}  top-right label; clicks come back as badge_click
+///   {"t":"badge","text":s|null,"pos"?:"rd","sgr"?}  top-right (or bottom-
+///        right) label, sgr: its SGR params; clicks come back as badge_click
 ///   {"t":"title","text":s|null}  window title (OSC 2); null restores the old one
 ///   {"t":"press","key":k,"id"?}  pi.press: enter/esc/tab/up/down/left/right/…
 ///   {"t":"commands","names":[..]} {"t":"completions","prefixes":[..]}
 ///   {"t":"keys","names":[..]}     what plugins registered (replaces the lists)
 ///   {"t":"key_result","id","prevent"}  answer to a {"t":"key"} question
-///   {"t":"complete_result","id","items":[..]}  answer to {"t":"complete"}
+///   {"t":"complete_result","id","items":[..],"pick"?:true}  answer to
+///        {"t":"complete"}; pick: send {"t":"picked","id","item"} instead of
+///        typing the choice, and type {"t":"pick_result","id","text"} (null: nothing)
 /// `id` on submit/press: reply {"t":"done","id"} once it has been typed.
 ///   {"t":"menu","id","items":[..]}  pi.menu
 ///   {"t":"paint","rows":[[row, text], ..]}  pi.sed results ("" blanks)
@@ -727,7 +902,10 @@ fn onSidecarLine(keys: *Keys, line: []const u8) void {
             for (items) |x| a.free(x);
             a.free(items);
         }
-        keys.finishCompletion(@intCast(int(m, "id") orelse return), items);
+        const pick = if (m.get("pick")) |v| v == .bool and v.bool else false;
+        keys.finishCompletion(@intCast(int(m, "id") orelse return), items, pick);
+    } else if (eql(u8, t, "pick_result")) {
+        keys.finishPick(@intCast(int(m, "id") orelse return), str(m, "text"));
     } else if (eql(u8, t, "buffer")) {
         if (str(m, "data")) |d| {
             keys.runner.push(.clear_box) catch {};
@@ -735,7 +913,7 @@ fn onSidecarLine(keys: *Keys, line: []const u8) void {
         }
     } else if (eql(u8, t, "arg")) {
         const k = str(m, "key") orelse return;
-        if (eql(u8, k, "fzf")) keys.setFzfArgs(str(m, "value") orelse "");
+        keys.setArg(k, str(m, "value") orelse "");
     } else if (eql(u8, t, "dialog")) {
         const d = buildDialog(a, m) catch return;
         const modal = if (m.get("modal")) |v| !(v == .bool and !v.bool) else true;
@@ -749,10 +927,17 @@ fn onSidecarLine(keys: *Keys, line: []const u8) void {
         sh.repaint();
     } else if (eql(u8, t, "badge")) {
         const text = if (str(m, "text")) |v| a.dupe(u8, v) catch return else null;
+        const rd = if (str(m, "pos")) |p| eql(u8, p, "rd") else false;
+        // Only digits and ';' reach the terminal.
+        const sgr = if (str(m, "sgr")) |v| (if (v.len > 0 and std.mem.indexOfNone(u8, v, "0123456789;") == null) a.dupe(u8, v) catch null else null) else null;
         sh.mutex.lock();
         defer sh.mutex.unlock();
-        sh.overlay.setBadge(text);
-        sh.repaint();
+        const old = if (rd) sh.overlay.badge_rd else sh.overlay.badge;
+        // A label that got no narrower just paints over the old one (the
+        // bottom-right one may tick every second); else the cells come back.
+        const grow = if (old) |o| (if (text) |n| overlay_mod.width(n) >= overlay_mod.width(o) else false) else true;
+        if (rd) sh.overlay.setBadgeRd(text, sgr) else sh.overlay.setBadge(text, sgr);
+        if (grow) sh.paintOverlay() else sh.repaint();
     } else if (eql(u8, t, "dialog_update")) {
         sh.mutex.lock();
         defer sh.mutex.unlock();
@@ -920,7 +1105,9 @@ fn buildDialog(a: std.mem.Allocator, m: std.json.ObjectMap) !overlay_mod.Dialog 
 /// which are handed to claude as-is. Anything else (a prompt, other flags)
 /// is `claude -p` mode. Callers also require stdin to be a terminal, so
 /// `echo hi | claude-p` keeps reading the prompt from stdin.
+/// `-a <cmd> [args…]` wraps another TUI instead of claude.
 pub fn wantsInteractive(argv: []const []const u8) bool {
+    if (otherApp(argv) != null) return true;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -934,7 +1121,15 @@ pub fn wantsInteractive(argv: []const []const u8) bool {
     return true;
 }
 
-/// `extra` is appended to the claude command line (see wantsInteractive).
+/// `-a <cmd> [args…]`: the command line of another TUI to wrap.
+fn otherApp(argv: []const []const u8) ?[]const []const u8 {
+    if (argv.len < 2 or !std.mem.eql(u8, argv[0], "-a")) return null;
+    return argv[1..];
+}
+
+/// `extra` is appended to the claude command line (see wantsInteractive),
+/// or is `-a <cmd> [args…]`: run that TUI as is (no hooks, no settings;
+/// pi.arg.border / prompt / … describe its screen).
 pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
     if (!posix.isatty(stdin_fd) or !posix.isatty(stdout_fd)) {
         term.writeAll(2, "claude-p: interactive mode needs a terminal (pass a prompt for `claude -p` mode)\n");
@@ -945,6 +1140,12 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
     defer allocator.free(data_dir);
     const scr_path = try std.fs.path.join(allocator, &.{ data_dir, "scr" });
     defer allocator.free(scr_path);
+    const log_path = try std.fs.path.join(allocator, &.{ data_dir, "host.log" });
+    defer allocator.free(log_path);
+    // `scr` and `host.log` are only written while they exist; touching one
+    // turns it on for this session. Declared before the sidecar's defer, so
+    // this runs after the sidecar is gone.
+    defer for ([_][]const u8{ scr_path, log_path }) |p| std.fs.cwd().deleteFile(p) catch {};
     const installed_path = try std.fs.path.join(allocator, &.{ data_dir, ".installed" });
     defer allocator.free(installed_path);
     const first_run = blk: {
@@ -967,8 +1168,10 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
     const claude_bin = posix.getenv("CLAUDE_P_CLAUDE") orelse "claude";
     var argv: std.ArrayList([]const u8) = .{};
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ claude_bin, "--settings", harness.settings_json });
-    try argv.appendSlice(allocator, extra);
+    if (otherApp(extra)) |app| try argv.appendSlice(allocator, app) else {
+        try argv.appendSlice(allocator, &.{ claude_bin, "--settings", harness.settings_json });
+        try argv.appendSlice(allocator, extra);
+    }
     const quoted = try driver.shellQuoteArgv(allocator, argv.items);
     defer allocator.free(quoted);
     const shell_cmd = try std.fmt.allocPrint(allocator, "exec {s}", .{quoted});
@@ -1028,7 +1231,16 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
         .cols = sz.cols,
         .rows = sz.rows,
         .pid = std.c.getpid(),
-        .arg = .{ .fzf = fzf.default_args },
+        .arg = .{
+            .fzf = fzf.default_args,
+            .whlSpeed = std.fmt.comptimePrint("{d}", .{default_wheel_speed}),
+            .border = "\u{2500}",
+            .prompt = "\u{276F}",
+            .bash = "!",
+            .busy = (screen.Rules{}).busy,
+            .running = (screen.Rules{}).running,
+        },
+        .app = if (otherApp(extra)) |app| app[0] else "claude",
     });
 
     var keys = try Keys.init(allocator, &shared, session);
@@ -1066,13 +1278,29 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
             const n = posix.read(stdin_fd, &inbuf) catch 0;
             if (n == 0) break;
             if (input.lastFocus(inbuf[0..n])) |f| keys.send(.{ .t = "focus", .focused = f });
-            if (!keys.handle(inbuf[0..n])) {
-                session.writeInput(inbuf[0..n]) catch {};
-                switch (input.decode(inbuf[0..n])) {
-                    .ctrl_c => ctrl_c_ns = @intCast(std.time.nanoTimestamp()),
-                    .focus_in, .focus_out => {},
-                    else => ctrl_c_ns = null,
+            const wheel = input.hasWheel(inbuf[0..n]);
+            if (wheel) {
+                shared.wheel_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
+                var scratch: std.ArrayList(u8) = .{};
+                defer scratch.deinit(allocator);
+                const net = input.splitWheel(allocator, inbuf[0..n], &scratch) catch 0;
+                if (net != 0) {
+                    keys.wheel_dir = if (net < 0) -1 else 1;
+                    keys.send(.{ .t = "wheel", .dir = keys.wheel_dir });
                 }
+            }
+            shared.mutex.lock();
+            const modal = shared.overlay.dialog != null or shared.overlay.menu != null;
+            shared.mutex.unlock();
+            if (wheel and !modal and keys.wheel_speed > 0) {
+                keys.onWheel(inbuf[0..n]);
+            } else if (!keys.handle(inbuf[0..n])) {
+                session.writeInput(inbuf[0..n]) catch {};
+                // Mouse motion, focus reports and the Ctrl key's release
+                // can arrive before CC exits; they don't count as a key.
+                if (input.decode(inbuf[0..n]) == .ctrl_c) {
+                    ctrl_c_ns = @intCast(std.time.nanoTimestamp());
+                } else if (!input.isNoise(inbuf[0..n])) ctrl_c_ns = null;
             }
         }
 
@@ -1121,6 +1349,16 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
 
         const now: i64 = @intCast(std.time.nanoTimestamp());
         keys.runner.tick(&keys, @divTrunc(now, std.time.ns_per_ms));
+        if (now - shared.last_output_ns.load(.seq_cst) >= overlay_settle_ns and
+            now - shared.wheel_ns.load(.seq_cst) >= wheel_window_ns)
+        {
+            shared.mutex.lock();
+            if (shared.overlay_stale and !shared.paused) {
+                shared.overlay_stale = false;
+                if (shared.overlay.active()) shared.paintOverlay();
+            }
+            shared.mutex.unlock();
+        }
         if (shared.dirty.load(.seq_cst) and now - last_scr_ns >= scr_interval_ns) {
             last_scr_ns = now;
             writeScr(&shared, scr_path, &keys);
@@ -1141,10 +1379,15 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
         @as(i64, @intCast(std.time.nanoTimestamp())) - t < ctrl_c_exit_window_ns
     else
         false;
+    // Quit with Ctrl+C: the conversation moves to ~/claude/last (an empty
+    // one stays and nothing is printed).
     if (quit_by_ctrl_c) if (keys.transcript) |t| {
-        if (convo.delete(t)) {
-            term.writeAll(1, "claude-p: quit with Ctrl+C, conversation deleted: ");
-            term.writeAll(1, t);
+        const last = try std.fs.path.join(allocator, &.{ keys.home, "claude", "last" });
+        defer allocator.free(last);
+        if (convo.stash(allocator, t, last, "~/claude/last")) |restore| {
+            defer allocator.free(restore);
+            term.writeAll(1, "To restore #> ");
+            term.writeAll(1, restore);
             term.writeAll(1, "\n");
         }
     };
@@ -1156,10 +1399,13 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
     return shared.exit_code.load(.seq_cst);
 }
 
-/// Dump the grid to `scr`, and to the sidecar when it subscribed.
+/// Dump the grid to `scr` (if the file exists), and to the sidecar when it
+/// subscribed. Neither: no snapshot at all.
 fn writeScr(shared: *Shared, scr_path: []const u8, keys: *Keys) void {
-    shared.mutex.lock();
+    const to_file = if (std.fs.cwd().access(scr_path, .{})) true else |_| false;
     shared.dirty.store(false, .seq_cst);
+    if (!to_file and !keys.scr_subscribed) return;
+    shared.mutex.lock();
     const text = shared.grid.snapshot(shared.allocator) catch {
         shared.mutex.unlock();
         return;
@@ -1168,6 +1414,7 @@ fn writeScr(shared: *Shared, scr_path: []const u8, keys: *Keys) void {
     shared.mutex.unlock();
     defer shared.allocator.free(text);
     if (keys.scr_subscribed) sendScr(keys, text, cur.y, cur.x);
+    if (!to_file) return;
     // Write-then-rename so readers never see a half-written frame.
     var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{scr_path}) catch return;
@@ -1197,6 +1444,8 @@ test "wantsInteractive" {
     try t.expect(!wantsInteractive(&.{"hello"}));
     try t.expect(!wantsInteractive(&.{ ".json", "hi" }));
     try t.expect(!wantsInteractive(&.{"--help"}));
+    try t.expect(wantsInteractive(&.{ "-a", "codex", "--full-auto" }));
+    try t.expect(!wantsInteractive(&.{"-a"}));
 }
 
 test {

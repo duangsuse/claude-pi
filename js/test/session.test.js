@@ -50,3 +50,19 @@ test('bashOutputRows: the ⎿ row and its continuation, not the header or the ne
   const rows = ['● Bash(ls)', '  ⎿  a.txt', '     b.txt', '', '● Read(x)', '  ⎿  Read 3 lines', '● Bash(pwd)', '  ⎿  /tmp']
   assert.deepEqual([...bashOutputRows(rows)], [1, 2, 7])
 })
+
+test('tailEntries: only new lines, a partial line waits, a shrunk file starts over', async () => {
+  const { tailEntries } = await import('../session.js')
+  const { mkdtempSync, writeFileSync, appendFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+  const f = join(mkdtempSync(join(tmpdir(), 'tail-')), 't.jsonl')
+  writeFileSync(f, '{"a":1}\n{"a":')
+  const tail = tailEntries()
+  assert.deepEqual(tail(f), [{ a: 1 }])
+  appendFileSync(f, '2}\n')
+  assert.deepEqual(tail(f), [{ a: 2 }])
+  assert.deepEqual(tail(f), [])
+  writeFileSync(f, '{"b":1}\n')
+  assert.deepEqual(tail(f), [{ b: 1 }])
+})

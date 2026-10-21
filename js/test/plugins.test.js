@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import net from 'node:net'
 import { tmpdir } from 'node:os'
 import addDir from '../plugins/add-dir.js'
-import webpane, { addresses, portInUse } from '../plugins/webpane.js'
+import webpane, { addresses, halfBlocks, portInUse } from '../plugins/webpane.js'
 import magpie from '../plugins/magpie.js'
 
 // A recording stand-in for pi: never touches a terminal or spawns anything
@@ -69,6 +69,13 @@ test('/ad without a dir only explains itself', async () => {
   addDir(pi)
   await commands.ad([])
   assert.deepEqual(calls, [['dialog', 'usage: /ad <dir>']])
+})
+
+test('halfBlocks: two module rows per line, light modules as foreground', () => {
+  const W = '\x1b[47m  \x1b[0m'
+  const B = '\x1b[40m  \x1b[0m'
+  const ansi = [W + W + B + B, W + B + W + B, B + W + W + B, ''].join('\n')
+  assert.equal(halfBlocks(ansi), '█▀▄ \n ▀▀ ')
 })
 
 test('webpane publishes pi.ext.webpane; /w does not start a second server when :3001 is taken', async () => {
