@@ -103,6 +103,24 @@ export async function addTrust(file, pattern) {
   return true
 }
 
+/**
+ * Drop every addTrust grant. The key goes entirely: the chrome-devtools MCP
+ * rejects an empty allowedUrlPattern, `{}` means "nothing trusted".
+ */
+export async function clearTrust(file) {
+  let cfg
+  try {
+    cfg = JSON.parse(await readFile(file, 'utf8')) || {}
+  } catch (e) {
+    if (e.code === 'ENOENT') return false // nothing was trusted
+    throw new Error(`${file}: ${e.message}`)
+  }
+  if (!('allowedUrlPattern' in cfg)) return false
+  delete cfg.allowedUrlPattern
+  await writeFile(file, JSON.stringify(cfg, null, 2) + '\n')
+  return true
+}
+
 /** Whether ~/.claude.json has a chrome-devtools MCP server (user or any project scope). */
 export function mcpInstalled(claudeJson) {
   let cfg

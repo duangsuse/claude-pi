@@ -24,10 +24,19 @@ type On = ((handlers: Partial<Events>) => () => void) & {
 }
 
 /**
- * 按钮回调：无参函数。返回字符串时，用它更新按钮文字（可以用来做 checkbox，
- * Ctrl+P 面板就是一组热替换文字的按钮）。
+ * 按钮：一个函数同时负责渲染和响应（P7）。
+ * up = false：host 取标签，返回字符串（undefined 用键名）。
+ * up = true：按下（Enter / 点击）。返回 undefined 关闭 dialog（resolve 为键名，`OK() {}` 照旧）；
+ * 其他返回值保持打开，整个 dialog 重新求值、和上次发出的 diff、只发变化的字段——
+ * 所以单选时旧 ● 新 ○ 一起变，不用记旧焦点。
  */
-type Button = () => string | void
+type Button = (up: boolean) => string | unknown
+
+/** P7：pi.onEmit 返回的读 / 写对：u.x 读，setU.x(2) 写，setU({ x: 2 }) 批量写；写入合并到下一 microtask 重新渲染。
+ *  给 await 之后 / 定时器里的更新用；同步状态用闭包变量即可，按下本身就会重渲染 */
+type Signal<T extends object> = [Readonly<T>, { [K in keyof T]: (v: T[K]) => void } & ((patch: Partial<T>) => void)]
+/** 文本字段可以是函数，每次渲染重新求值 */
+type Text = string | (() => string)
 
 /**
  * gum 风格的多行 dialog。
@@ -37,9 +46,11 @@ type Button = () => string | void
  * 按钮返回字符串：改按钮文字、dialog 保持打开；返回其他值：关闭 dialog。
  */
 type Dialog = {
-  title?: string
-  body?: string
-  footer?: string
+  title?: Text
+  body?: Text
+  footer?: Text
+  /** P7：重新渲染后怎么发：'full' 整个 dialog 重发（Zig 整体替换，host 不 diff）；'2'（默认）只发变化的字段 */
+  update?: 'full' | '2'
   /** 非模态：显示在右上角，只借用 ←/→ 选按钮（其余键照常给 CC）；选过之后 Enter 按下、Esc 关闭，
    *  直到有键交给 CC；按钮也可以鼠标点击。timeout 毫秒后按下选中的按钮，每次交互重新计时
    *  （初始选中 `or`；没有 or 且没动过则 resolve null）。正文末尾自动附上 "(3s)" 这样的延时 */
@@ -86,23 +97,24 @@ interface Pi {
   sed(fn: (ln: string, i: number, rows: string[]) => string | null): () => void
   on: On
   /** resolve 为按下的按钮文字；Esc 关闭时为 null */
-  /** resolve 为按下的按钮文字；Esc 关闭时为 null。返回的 Promise 也是句柄：relabel(按钮文字或序号, 新文字)、text({ title, body, footer }) */
-  dialog(d: Dialog): Promise<string | null> & { relabel(from: string | number, to: string): void; text(t: { title?: string; body?: string; footer?: string }): void }
+  /** resolve 为按下的按钮键名；Esc 关闭时为 null。返回的 Promise 也是句柄：ret(value) 在任何地方关闭并 resolve 为 value。
+   *  （P7 删掉了 relabel / text / hint：标签和正文都在渲染时重新求值） */
+  dialog(d: Dialog): Promise<string | null> & { ret(value?: string | null): void }
+  /** P7：异步状态。dialog 的 Text / Button / hints 里读它，写入后 host 重新渲染并只发变化的字段 */
+  onEmit<T extends object>(initial: T): Signal<T>
   /** 输入框上方的下拉菜单，↑/↓ 选择、Enter 确认；resolve 为选中项，Esc 为 null */
   menu(items: string[]): Promise<string | null>
-  /**
-   * 鼠标点击网格某一行时回调，i_row 是屏幕行号（0 起）。
-   * 点在输入框箭头（❯）那一行及其下方的不算：输入框、状态栏的点击照常交给 CC。
-   */
-  click(handler: (i_row: number) => void): () => void
+
   /** notify-send（macOS 用 osascript）。'snack'：文字放到右上角角标（替换 ◆ plugins n/m），
    *  'snackRD'：右下角；点进去仍是插件列表，'' 撤下。每个插件每个角一条，显示最新的 */
   notify(msg: string, where?: 'snack' | 'snackRD', style?: { bg?: number | `#${string}` | 'none' }): void
   /** 跑一行 shell：插值的值会被单引号转义（防注入）；shell 退出即 resolve，长期运行的程序在行尾加 & */
   sh(strings: TemplateStringsArray, ...values: unknown[]): Promise<{ code: number; stdout: string; stderr: string }>
+
   /** 终端侧的辅助 */
   tui: {
-    /** 按一个键，排在之前的 pi`…` 之后：enter esc tab shift-tab backspace up down left right ctrl-c */
+    /** 按一个键，排在之前的 pi`…` 之后：enter esc tab shift-tab backspace up down left right ctrl-c ctrl-o ctrl-r；
+     *  P6 加 pgup pgdn home end ctrl-home */
     press(key: string): Promise<void>
     /** 等屏幕出现某段文字（或谓词为真），超时 resolve false；默认 3000ms */
     wait(cond: string | ((s: Scr) => boolean), ms?: number): Promise<boolean>
@@ -114,7 +126,11 @@ interface Pi {
      *  transcript 是最近一次 hook 给出的会话 JSONL 路径 */
     state: { cols: number; rows: number; focused: boolean; scr: Scr | null; transcript: string | null }
   }
-
+  /**
+   * 鼠标点击网格某一行时回调，i_row 是屏幕行号（0 起）。
+   * 点在输入框箭头（❯）那一行及其下方的不算：输入框、状态栏的点击照常交给 CC。
+   */
+  click(handler: (i_row: number) => void): () => void
   // P6：消息边界和 scrollInView
   mark(name?: string): void
   scrollTo(name: string): Promise<void>
@@ -147,10 +163,25 @@ export default (pi: Pi) => {
   pi.on({ scrcpy(s) {} })
   pi.dialog({ title: 'T', body: '...', footer: '', OK() {}, '[ ] web': () => '[x] web' })
   pi.dialog({ title: 'Ctrl+P', eachRow: [2, 2], model() {}, effort() {}, plan() {}, web() {} })
+  // P7：按钮一个函数管渲染（up=false 返回标签）和按下（up=true，返回非 undefined 保持打开）。
+  // 按下后整个 dialog 重算再 diff：单选的旧 ● 新 ○ 一起变。同步状态用闭包变量；
+  // 异步的（await 之后、定时器）用 pi.onEmit，setU 触发重渲染。
+  let sel = 'A'
+  let web = 0
+  const radio = (name: string) => (up: boolean) => (up ? (sel = name) : null, sel === name ? `● ${name}` : `○ ${name}`)
+  const [u, setU] = pi.onEmit({ cost: 0 })
+  const dlg = pi.dialog({
+    body: u.cost.As(n => `selected ${sel} · $${n.toFixed(2)}`), // 单变量监听derive
+    A: radio('A'),
+    B: radio('B'),
+    web: up => (up ? (web ^= 1) : null, web ? '[x] web' : '[ ] web'),
+    Done: () => {}, // 返回 undefined：关闭
+  })
+  setTimeout(() => setU.cost(0.12), 1000) // 正文随之更新，只发 body
+  setTimeout(() => dlg.ret(null), 10_000)
   pi.click(i_row => {})
   pi.BUFFER = '草稿，不回车'
   pi.arg.fzf = "--pointer '▶' --height=60%"
-  pi.arg.whlSpeed = '0'          // 默认 '0' 透传；n：几格滚轮算一次 PgUp / PgDn
   // 界面识别（cld-pi -a 套别的 TUI 时改；默认是 CC 的硬编码）：输入框边框字符、提示符、bash 模式提示符、忙碌 / 命令运行中的关键字
   pi.arg.border = '─'; pi.arg.prompt = '❯'; pi.arg.bash = '!'; pi.arg.busy = 'esc to interrupt'; pi.arg.running = 'Running…'
   pi.notify('● 2.1s · 3m $0.12', 'snackRD')

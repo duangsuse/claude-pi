@@ -2,8 +2,10 @@
 // hot-swapped; a change goes to CC and the label only moves once the new
 // state is read back off the screen (or the settings file).
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { bashOutputRows, effortOf, efforts, modeOf, modes, modelFamily, models, summarizeTranscript } from '../session.js'
+import { clearTrust } from './f12.js'
 
 // Permission checkboxes → allow rules in the project's settings.local.json
 // (CC reloads it on change).
@@ -34,8 +36,42 @@ export function setAllowed(path, key, on) {
 export const radio = (v, cur) => `${v === cur ? '●' : '○'} ${v}`
 export const checkbox = (name, on) => `[${on ? 'x' : ' '}] ${name}`
 const sleep = ms => new Promise(r => setTimeout(r, ms))
-// "Set model to Opus 5.5" etc.
-const modelSet = fam => s => new RegExp(`Set model to[^\\n]*${fam}`, 'i').test(s.text)
+
+/** "3h7m": whole hours and minutes since an epoch-seconds time. */
+export const sinceLabel = sec => `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`
+
+/** ~/.F12-mcp.json: the sites the f12 plugin's addTrust let Chrome reach. */
+export const trustPath = join(homedir(), '.F12-mcp.json')
+
+/** The sites pi.ext.f12.addTrust has trusted (~/.F12-mcp.json), as hosts. */
+export function trustedSites(path = trustPath) {
+  try {
+    const list = JSON.parse(readFileSync(path, 'utf8')).allowedUrlPattern
+    if (!Array.isArray(list)) return []
+    return list.map(p => {
+      try {
+        return new URL(String(p)).host
+      } catch {
+        return String(p)
+      }
+    })
+  } catch {
+    return []
+  }
+}
+
+/** Files git reports as changed, and how long ago the last commit was. */
+export function gitSummary(status, commitTime, now = Date.now() / 1000) {
+  const n = String(status ?? '').split('\n').filter(l => l.trim()).length
+  const t = Number(String(commitTime ?? '').trim())
+  const age = Number.isFinite(t) && t > 0 ? sinceLabel(Math.max(0, now - t)) : null
+  return `${n} changed file${n === 1 ? '' : 's'}${age ? ` · ${age} since last commit` : ''}`
+}
+
+// CC's answer to `/model x`: "Set model to `Name`" / "Kept model as `Name`".
+// A gateway (ANTHROPIC_DEFAULT_*_MODEL) may resolve every alias to the same
+// model, so the family picked is not in the text — match the message only.
+const modelSet = text => /Set model to|Kept model as/.test(text)
 const actions = ['CtrlO', 'CtrlR', 'Undo', 'Copy']
 
 export default pi => {
@@ -67,10 +103,20 @@ export default pi => {
     const cur = { model: modelFamily(sum.model), effort: effortOf(text), mode: modeOf(text) }
     let file = isAllowed(readSettings(path), 'file')
     let web = isAllowed(readSettings(path), 'web')
+    // The permission checkboxes' hints: what git sees right now, and the
+    // sites f12's addTrust has let Chrome reach (nothing else).
+    const [status, commit] = await Promise.all([
+      pi.sh`git status --porcelain 2>/dev/null`,
+      pi.sh`git log -1 --format=%ct 2>/dev/null`,
+    ])
+    const fileHint = gitSummary(status.stdout, commit.stdout)
+    const webHint = trustedSites().join(' · ')
 
     // Rows of buttons; a radio row is relabeled as a whole once CC agrees.
     const rows = { model: models, effort: efforts, mode: modes }
     const offset = { model: 0, effort: models.length, mode: models.length + efforts.length }
+    // file / web / bash sit right after the radio rows.
+    const checkboxBase = models.length + efforts.length + modes.length
     let dlg
     const pick = (row, v) => {
       cur[row] = v
@@ -82,8 +128,11 @@ export default pi => {
     const radioHints = (row, hint) => Object.fromEntries(rows[row].map(v => [radio(v, cur[row]), hint(v)]))
 
     const setModel = async to => {
+      const before = await screen()
       await pi`/model ${to}`
-      if (await tui.wait(modelSet(to), 3000)) return pick('model', to)
+      // The frame has to change too: an older "Set model to" line may still
+      // be on screen from a previous switch.
+      if (await tui.wait(s => s.text !== before && modelSet(s.text), 3000)) return pick('model', to)
       return radio(to, cur.model)
     }
     const setEffort = async to => {
@@ -123,8 +172,8 @@ export default pi => {
         ...radioHints('model', v => `/model ${v}`),
         ...radioHints('effort', v => `/effort ${v}`),
         ...radioHints('mode', v => `${v === 'acc' ? 'accept edits' : v} mode (Shift+Tab until the status line agrees)`),
-        [labels.file]: 'Allow Edit / Write without asking (.claude/settings.local.json)',
-        [labels.web]: 'Allow WebFetch / WebSearch without asking (.claude/settings.local.json)',
+        [labels.file]: fileHint,
+        [labels.web]: webHint,
         [labels.bash]: 'Show or hide Bash tool output on screen',
         CtrlO: 'Open the transcript (Ctrl+O)',
         CtrlR: 'Search prompt history (Ctrl+R)',
@@ -137,11 +186,19 @@ export default pi => {
       [labels.file]: () => {
         setAllowed(path, 'file', !file)
         file = isAllowed(readSettings(path), 'file')
+        dlg.hint(checkboxBase, '')
         return checkbox('file', file)
       },
-      [labels.web]: () => {
+      [labels.web]: async () => {
         setAllowed(path, 'web', !web)
         web = isAllowed(readSettings(path), 'web')
+        // Toggling also revokes what addTrust granted, not just the hint.
+        try {
+          await clearTrust(trustPath)
+        } catch (e) {
+          pi.dialog({ body: `allowedUrlPattern not cleared: ${e.message}`, timeout: 4000 })
+        }
+        dlg.hint(checkboxBase + 1, '')
         return checkbox('web', web)
       },
       [labels.bash]: () => {

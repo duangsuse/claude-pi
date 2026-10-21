@@ -56,8 +56,9 @@ rc 文件。
 | 用 Ctrl+C 退出 | 把这次对话从 `~/.claude/projects/` 移到 `~/claude/last`（覆盖上一次的），并打印 `To restore #> mv ~/claude/last …`；空会话不输出；想保留就用 `/exit` 退出 |
 | 鼠标滚轮 | 原样交给 Claude Code，滚动时叠加层让开，停下再画回来（`pi.arg.whlSpeed = n`：改成 n 格一次 PgUp / PgDn） |
 | 双击 | 顺着上次滚轮的方向翻一页（PgUp / PgDn） |
+| 点击以 `.png` / `.webp` 结尾的一行 | 用 `imv` 打开该文件（没有 `imv` 时用 `xdg-open`）；输入框和状态栏上的点击仍交给 CC |
 | Ctrl+Enter | 粘贴剪贴板并提交（终端需支持 kitty 键盘协议或 modifyOtherKeys） |
-| Ctrl+P | 设置面板：会话名和花费、model / effort / mode、file / web 权限、隐藏 Bash 输出、CtrlO / CtrlR / Undo / Copy |
+| Ctrl+P | 设置面板：会话名和花费、model / effort / mode、file / web 权限（web 开关还会撤销 `//` 加进 `~/.F12-mcp.json` 的站点）、隐藏 Bash 输出、CtrlO / CtrlR / Undo / Copy |
 | 单行输入 `/~/名字` 后回车 | 创建 `~/claude/名字`；Yakuake / Guake 里直接开新 tab 运行 `cd … && npx cld-pi`，其他终端把命令复制到剪贴板，在新终端粘贴即可打开 |
 
 ## 命令
@@ -128,6 +129,7 @@ pi.notify('busy', 'snackRD', { bg: 236 })    // 右下角；bg：0-255、'#rrggb
 await pi.dialog({ title: 'Hi', body: 'gum-style', OK: () => {}, Stat: () => pi`/status` })
 pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // 非模态，右上角，正文实时倒计时 "(3s)"；←/→、点击会停止计时
 pi.sed(ln => ln.includes('secret') ? '' : null)   // blank / rewrite screen rows
+pi.click(row => …)   // 点击输入框上方的第 row 行（img.js：点到 .png / .webp 行就用 imv 打开）
 await pi.on.stop      // wait for the next Stop hook
 ```
 

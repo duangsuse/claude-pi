@@ -60,10 +60,11 @@ cost in the bottom-right corner. Both corners open the plugin list.
 | `//gh/…` + Tab | URLs on that site (`gh` → github.com) from your tabs and Chrome history |
 | Ctrl+C | clears the caret's line and the lines below, caret stays on a fresh line; empty box → Claude Code's own Ctrl+C |
 | Ctrl+Enter | paste the clipboard and submit (needs a kitty-protocol or modifyOtherKeys terminal) |
-| Ctrl+P | settings panel: session name + cost, model / effort / mode, file / web permissions, hide Bash output, CtrlO / CtrlR / Undo / Copy |
+| Ctrl+P | settings panel: session name + cost, model / effort / mode, file / web permissions (the web toggle also revokes the sites `//` added to `~/.F12-mcp.json`), hide Bash output, CtrlO / CtrlR / Undo / Copy |
 | quitting with Ctrl+C | moves that conversation out of `~/.claude/projects/` to `~/claude/last` (replacing the previous one) and prints `To restore #> mv ~/claude/last …`; an empty session prints nothing (quit with `/exit` to keep it) |
 | mouse wheel | goes to Claude Code untouched; overlays step aside until it stops (`pi.arg.whlSpeed = n`: n notches = one PgUp / PgDn instead) |
 | double click | pages (PgUp / PgDn) the way the wheel last went |
+| click a row ending in `.png` / `.webp` | opens that file in `imv` (`xdg-open` where `imv` is missing); clicks on the input box and the status line still go to CC |
 | Enter on a single line `/~/name` | creates `~/claude/name`; in Yakuake / Guake it opens a new tab and runs `cd … && npx cld-pi` there, elsewhere it copies the command to paste in a new terminal |
 
 ## Commands
@@ -140,6 +141,7 @@ pi.notify('busy', 'snackRD', { bg: 236 })    // bottom-right; bg: 0-255, '#rrggb
 await pi.dialog({ title: 'Hi', body: 'gum-style', OK: () => {}, Stat: () => pi`/status` })
 pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // non-modal, top-right, counts down "(3s)"; ←/→ / click stops the countdown
 pi.sed(ln => ln.includes('secret') ? '' : null)   // blank / rewrite screen rows
+pi.click(row => …)   // a plain click on grid row `row` above the input box (img.js: .png / .webp rows → imv)
 await pi.on.stop      // wait for the next Stop hook
 ```
 

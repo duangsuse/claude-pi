@@ -327,6 +327,17 @@ export function createHost(send, log = () => {}, io = {}) {
       if (!modal) out.body = withLeft(dlg.base, dlg.remaining)
       send({ t: 'dialog_update', id, ...out })
     }
+    // The hint line under the buttons: what the focused button does. A
+    // plugin can replace it (e.g. a panel that toggled a checkbox clears
+    // its hint); only the button in focus shows it.
+    done.hint = (from, text) => {
+      const dlg = dialogs.get(id)
+      if (!dlg) return
+      const index = typeof from === 'number' ? from : dlg.labels.indexOf(from)
+      if (index == null || index < 0) return
+      dlg.hints[index] = text == null || text === '' ? '' : String(text)
+      if (dlg.active === index) send({ t: 'dialog_update', id, footer: dlg.hints[index] ?? dlg.footer })
+    }
     if (!modal) {
       const dlg = dialogs.get(id)
       const fire = async () => {
@@ -376,6 +387,7 @@ export function createHost(send, log = () => {}, io = {}) {
   const pressButton = async ({ id, index }) => {
     const dlg = dialogs.get(id)
     if (!dlg) return
+    dlg.active = index
     dlg.stop?.()
     let r
     try {
@@ -408,13 +420,16 @@ export function createHost(send, log = () => {}, io = {}) {
   // on every frame dump; only paint sets that changed are sent.
   const seds = [] // { fn, p }
   const waiters = new Set() // pi.tui.wait conditions, checked per frame
+  const clickers = new Set() // { fn, p }: pi.click handlers
   let lastPaint = '[]'
-  let subscribed = false
+  let subscribed = null
   const syncSubscribe = () => {
-    const want = seds.length > 0 || waiters.size > 0
-    if (want !== subscribed) {
-      subscribed = want
-      send({ t: 'subscribe', scr: want })
+    // A click handler needs the frame it clicked on, so both go together.
+    const want = { scr: seds.length > 0 || waiters.size > 0 || clickers.size > 0, click: clickers.size > 0 }
+    const json = JSON.stringify(want)
+    if (json !== subscribed) {
+      subscribed = json
+      send({ t: 'subscribe', ...want })
     }
   }
   pi.sed = fn => {
@@ -428,6 +443,19 @@ export function createHost(send, log = () => {}, io = {}) {
       syncSubscribe()
       // Repaint without it now rather than on the next frame.
       runSed(state.scr?.rows ?? [])
+    })
+  }
+
+  // pi.click(fn): a plain click on grid row `row` (0-based). Clicks on the
+  // input box and the status line below it stay CC's, so they never arrive.
+  // The row's text is tui.state.scr.rows[row].
+  pi.click = fn => {
+    const entry = { fn, p: owner() }
+    clickers.add(entry)
+    syncSubscribe()
+    return track(() => {
+      clickers.delete(entry)
+      syncSubscribe()
     })
   }
 
@@ -719,6 +747,17 @@ export function createHost(send, log = () => {}, io = {}) {
         const m = menus.get(msg.id)
         menus.delete(msg.id)
         m?.resolve(msg.index == null ? null : m.list[msg.index] ?? null)
+        break
+      }
+      case 'click': {
+        const row = Number(msg.row)
+        for (const c of [...clickers]) {
+          try {
+            inOwner(c.p, () => c.fn(row))
+          } catch (e) {
+            log('click handler threw', e)
+          }
+        }
         break
       }
       case 'badge_click':

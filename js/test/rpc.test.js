@@ -106,7 +106,7 @@ test("sed: '' blanks, null leaves the row alone; only changes are sent", () => {
   const { pi, dispatch } = createHost(m => sent.push(m))
   pi.sed(ln => (ln.includes('secret') ? '' : null))
   pi.sed(ln => (ln.includes('foo') ? ln.replace('foo', 'bar') : null))
-  assert.deepEqual(sent, [{ t: 'subscribe', scr: true }])
+  assert.deepEqual(sent, [{ t: 'subscribe', scr: true, click: false }])
   const frame = { t: 'scr', rows: ['ok', 'secret 1', 'foo'], cursor: { row: 0, col: 0 } }
   dispatch(frame)
   assert.deepEqual(sent[1], { t: 'paint', rows: [[1, ''], [2, 'bar']] })
@@ -185,7 +185,7 @@ test('turning a plugin off drops its listeners, seds and timers; on re-runs it',
   assert.equal(stops, 1)
   assert.equal(ticks, ticksAtOff)
   assert.deepEqual(sent.findLast(m => m.t === 'paint'), { t: 'paint', rows: [] })
-  assert.deepEqual(sent.findLast(m => m.t === 'subscribe'), { t: 'subscribe', scr: false })
+  assert.deepEqual(sent.findLast(m => m.t === 'subscribe'), { t: 'subscribe', scr: false, click: false })
   assert.deepEqual(sent.findLast(m => m.t === 'badge'), { t: 'badge', text: ' ◆ plugins 0/1 ' })
 
   await host.setEnabled('p.js', true)
@@ -358,11 +358,11 @@ test('pi.tui.wait matches text or a predicate, times out with false; press sends
   const sent = []
   const { pi, dispatch } = createHost(m => sent.push(m))
   const w = pi.tui.wait('Yes, for this session', 500)
-  assert.deepEqual(sent.at(-1), { t: 'subscribe', scr: true })
+  assert.deepEqual(sent.at(-1), { t: 'subscribe', scr: true, click: false })
   dispatch({ t: 'scr', rows: ['nothing yet'], cursor: { row: 0, col: 0 } })
   dispatch({ t: 'scr', rows: ['❯ 1. Yes, for this session'], cursor: { row: 0, col: 0 } })
   assert.equal(await w, true)
-  assert.deepEqual(sent.at(-1), { t: 'subscribe', scr: false })
+  assert.deepEqual(sent.at(-1), { t: 'subscribe', scr: false, click: false })
   assert.equal(await pi.tui.wait(s => s.rows.length > 5, 20), false)
   pi.tui.press('enter')
   assert.deepEqual(sent.at(-1), { t: 'press', key: 'enter', id: 1 })

@@ -98,10 +98,27 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
 - 站点 → `allowedUrlPattern`：`<协议>//<host>/*`。文件不存在时写 `{}`（不能写空数组，MCP 会拒绝空的 `allowedUrlPattern`）。
 - MCP 提示：第一次 `//` 截图后，`~/.claude.json` 里没有 `chrome-devtools` 就弹出安装命令（Copy / Later），只提示一次（`~/claude/-p/f12-mcp-offered`）。chrome-devtools-mcp 1.11.0 还没有 `--watchConfig`，只会打印 Unknown arguments，不影响启动。
 
-### 概览 WebUI
+### 概览 WebUI（P6，未开始）
 - 从 transcript JSONL 生成类似 ChatGPT 的「每轮提问前缀」目录，sidecar 起一个本地 http 服务。
 - 用 `chrome --app=http://127.0.0.1:PORT --window-size=420,800` 打开成小窗口。
-- 点击某一条后：wrapper 向 pty 发 Ctrl+O transcript 搜索。
+- 点击某一条后：wrapper 向 pty 发 Ctrl+O 进 transcript 视图，定位到那一轮。
+
+已有、可以直接复用的件（都在 sidecar / 插件层）：
+- 会话 JSONL 路径：`pi.tui.state.transcript`（来自 hook payload；`/clear` 后会换）。增量读取 `session.js` `tailEntries()`，整段解析 `parseEntries()`，每轮花费 `messageCost()`。
+- 端口探测 + 地址 dialog：`pi.ext.webpane.boundPort(port)`（webpane.js）。
+- 按键：`pi.tui.press('ctrl-o')`；等屏幕：`pi.tui.wait(text | pred, ms)`（每帧 30ms 轮询 `scr`）。
+- 命令注册 `pi.command('o', …)`；拉起 chrome 用 `pi.sh`。
+
+要补的（实现说明，`js/plugins/outline.js`）：
+1. Zig `keyBytes`：加 `pgup` `pgdn` `home` `end` `ctrl-home`（`\x1b[5~` `\x1b[6~` `\x1b[H` `\x1b[F` `\x1b[1;5H`），`pi.tui.press` 直接可用。
+2. 目录条目 `{ i, uuid, ts, prefix, cost }`：从 transcript 的 `type:'user'` 条目生成，跳过 tool_result、`isMeta`、`<command-name>` 这类本地命令回显；`prefix` 取首行前 60 字、空白折叠。不另加 hook：`user(msg)` 事件（goal-v1.ts）由 transcript tail 的新 user 条目触发，比注入 `UserPromptSubmit` 少一个 hook，还能拿到 uuid / timestamp。
+3. http：`node:http` 监听 `127.0.0.1` 随机端口；`GET /` 页面、`GET /outline.json`、`POST /goto {i}`；页面 1s 轮询或 EventSource 刷新。`pi.htmlJSONL(html)` 返回双向 JSON 通道（goal-v1.ts），页面端用 `fetch` / `EventSource` 对接。
+4. 开窗：`chrome --app=URL --window-size=420,800`，二进制按 `google-chrome` → `chromium` → `chromium-browser` → macOS `open -a "Google Chrome" --args` 找；都没有就 dialog 显示 URL + Copy 按钮。
+5. 定位（`pi.scrollTo`）：Ctrl+O 进 transcript 视图 → Ctrl+Home 到顶 → 循环 PgDn，每页 `tui.wait(s => s.text 含目标前缀)`，命中即停；上限 300 页，超过 toast 放弃并 Esc 退出视图。前缀按屏幕折行后的样子比：取前 ~40 个非空白字符、折叠空白。
+6. `pi.mark(name)` 记当前最后一个 user uuid，`pi.scrollTo(name)` 走 5。
+- 验收：50 轮会话点任意一条都能定位；`/clear` 后目录清空重建；没有 chrome 时退化为 dialog 显示 URL。
+- 风险：CC 的 Ctrl+O 视图是否吃 Ctrl+Home / PgDn 还没实测——先用 `cc-probe.py` 录一次 `.vt`，把视图状态加进 `screen.zig`（Rules 加一个 `transcript` 关键字）再写定位循环。每页至少一帧（30ms）加 CC 重绘，50 轮 × 长输出可能几十页。
+- 估算：Zig ~60（keyBytes + Rules），JS ~350。
 
 ### 事件
 - 用 `--settings` 内联注入 Notification、Stop、SessionStart hook，沿用原项目的 FIFO 机制。
@@ -112,6 +129,30 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
 - dialog 的按钮背景默认在左右各 `fadeX/2` 列内渐隐到黑色（`pi.dialog({ fadeX })`，0 关闭），避免色块硬边。
 - `pi.notify(msg, 'snack' | 'snackRD')`：文字放到右上角角标（替换 `◆ plugins n/m`）或右下角，点进去仍是插件列表；默认插件 `pace.js` 用右下角显示上一条 ● 的耗时（下一条在路上时实时计时）和近 3 分钟的花费（复用 session.js 的计价和去重）；滚轮滚动时变透明（`{ bg: 'none' }`），停下 0.5s 恢复。第三个参数 `{ bg }` 设背景：0-255、`'#rrggbb'`、`'none'`。
 - 插件列表：右上角 `◆ plugins n/m` 角标，鼠标点击（SGR 鼠标上报）打开一行一个按钮的 dialog（`eachRow: 'vertical'`），Enter 开关某个插件；关闭即撤销它的 pi.on / pi.sed / 定时器（宿主 hook 了 setInterval / setTimeout）。
+
+### 滚动：输出不经过 VT（P7）
+滚动卡顿。读码（2026-10-22）看到三项都在输出热路径上，而滚动期间没有任何人读网格：
+1. zmux 读线程的回调里 `grid.feed` 先于 stdout 写，整段持有和主循环共用的 `Shared.mutex`——网格是同步的，不是异步的。
+2. `◆ plugins n/m` 角标常驻，`overlay.active()` 永远为真：滚轮窗口（150ms）之外每个 CC chunk 都走 `composeFrame`（复制 chunk + `overlay.render` + `restoreCursor` 跑一遍 ghostty `ScreenFormatter` + `?2026` 包裹）。
+3. `img.js` 注册 `pi.click`，而 `pi.click` 被绑在 `scr` 订阅上：只要有输出，每 30ms 一次全屏 `grid.snapshot` + JSON 发给 sidecar（也在 mutex 里）。
+
+决定：
+1. **网格懒喂**。读线程只把字节追加到 pending 缓冲并直接写 stdout（不包 `?2026`）；真正 `feed` 推迟到有人要读网格时——按键要 `box()`、画 overlay、`scr`、输出静止 40ms——由主线程做。pending 超过 4MB 也强制喂一次。字节顺序不变，所以网格的最终状态和现在完全一致（`testdata/*.vt` 回放测试不变）。
+2. **只在和 wrapper 交互时逐帧合成**。模态 dialog / menu 打开时仍每帧合成（否则闪，P2 的验收）；其余时候（角标、toast、涂抹）一律输出静止 40ms 后补画——把现在滚轮窗口内的做法推广到所有时刻。合成前先把 pending 喂完。
+3. **`pi.click` 不再订阅 `scr`**：click 消息自带该行文本（`{"t":"click","row":n,"text":"…"}`，Zig 只取那一行）；`scr` 只给 `pi.sed` / `pi.tui.wait`。
+4. **先量再改**：`--debug` 下记录每个 chunk 的 feed / compose 耗时和 `scr` 次数，改前改后各跑一次 50 轮会话的滚轮；验收是滚动手感和裸 `claude` 无差别。
+
+### dialog：Signal API（P7）
+dialog 的每次更新都要过一次 IPC，UI 也只有 Zig 这一个消费者，命令式句柄（`relabel` / `text` / `hint`）省不了什么：`panel.js` 230 行大半在维护标签字符串，一行单选改一次要发 4–5 条 `dialog_update`，还得同时记住旧焦点和新焦点。改成 **old → new 主导**：每次状态变化把整个 dialog 重新求值，和上次发出去的 diff，只发变化的字段。`relabel` / `text` / `hint` 整个删掉，不留糖。
+- **按钮就是一个函数** `A: up => …`，同时负责渲染和响应：host 用 `up = false` 调它取标签（返回字符串；返回 undefined 用键名），用 `up = true` 调它表示按下（Enter / 点击）。按下后整个 dialog 重新渲染，所以单选时旧的 ● 和新的 ○ 一起变，不需要知道"上一个是谁"（承认有点 hacky：一次按下 = 全量重算，但 dialog 就几十个格子）。例：开关 `A: up => up ? (a ^= 1, lbl()) : lbl()`；helper `radio(name, [u, setU], 'sel')` 返回这样一个 `up =>`。
+- **按下的返回值**：undefined → 关闭，resolve 为该按钮的键名（`OK() {}` 照旧）；其他 → 保持打开、重新渲染。任何地方（定时器、别的按钮、await 之后）都可以 `dlg.ret(value)` 关闭并 resolve 为 value。
+- title / body / footer / hints 的值可以是 `() => string`，每次渲染重新求值。
+- `const [u, setU] = pi.onEmit({ x: 1 })`：`u.x` 读、`setU.x(2)` 写、`setU({ x: 2 })` 批量写；写入合并到下一 microtask 触发渲染。给 await 之后、定时器里的更新用；同步状态直接用闭包变量就够，按下本身就会重渲染。
+- `update: 'full' | '2'`（默认 `'2'`）：`'full'` 每次整个 dialog 重发，Zig 整体替换，host 不 diff；`'2'` 只发变化的字段——`dialog_update` 加 `buttons: [...]`（整组标签）和 `hints`，一行单选从 5 条变 1 条。
+- 渲染时机：打开；每次 `up = true` 回调返回（Promise 则 await 之后）；`setU` 写入后的 microtask；焦点变化（`dialog_active`，footer 里的 hint 跟着换）。
+- Zig 只加 `dialog_update.buttons` / `hints`，其余不动。
+- 迁移：`panel.js`（relabel / hint，`radio()` / `pick()` / `offset` 全部消失）、`webpane.js`（`dlg.text`）、`rpc.js` `showPluginList`。无参的 `OK() {}` 不用改。
+- 待确认：`'2'` 按"字段级 diff"理解；"按下返回 undefined 即关闭"这条规则。
 
 ### 首次运行
 检测到 `~/claude/-p/.installed` 不存在时，打印一条命令让用户自己执行（只打印，不自动修改 rc）：
@@ -131,8 +172,9 @@ echo 'claude-p-w(){ BUFFER=claude-p; zle accept-line }; zle -N claude-p-w; bindk
 | **P3 插件系统和默认插件** ✅ 待手测 | 插件 API；加载 `~/claude/-p/*.js`；`/m`、`/w`、`/ad` | 150 | 350 | 写一个用户插件能自动加载，3 个默认命令都能用 |
 | **P4 Ctrl+P 面板** ✅ 待手测 | 按钮；session 名和花费；bash 输出涂抹开关；基于 pi.dialog({}) 的面板 | 350 | 250 | 每个控件都和 CC 实际状态同步（改完后从状态栏读回来核对） |
 | **P5 浏览器** ✅ 待手测 | 预检查；`//` 选标签页截图 + 控制台快照（`.f12.md`）；`//gh/` 补全；`pi.ext.f12.devtools` 实时读取；维护 `~/.F12-mcp.json`；提示 MCP 安装命令 | 50 | 380 | 能选中标签页并插入 `@png @f12.md`，Claude 能读到截图和 URL / 控制台；插件能实时问同一个标签页 |
-| **P6 概览 WebUI** | JSONL 转目录；chrome app 小窗口；进 Ctrl+O，按 Ctrl+Home 跳到顶部，然后一边 PgDn 一边 poll | 100 | 350 | 50 轮的会话里点任意一条都能定位到 |
-| **合计** | | ~2000 | ~1600 | |
+| **P6 概览 WebUI** | JSONL 转目录（`outline.js`）；`node:http` + chrome app 小窗口；`keyBytes` 加 PgUp / PgDn / Ctrl+Home；进 Ctrl+O，Ctrl+Home 跳到顶部，然后一边 PgDn 一边 `tui.wait`；`pi.mark` / `pi.scrollTo` / `pi.htmlJSONL` | 60 | 350 | 50 轮的会话里点任意一条都能定位到；`/clear` 后目录重建；没有 chrome 退化为 dialog 显示 URL |
+| **P7 滚动与 Signal** | 网格懒喂 + 只在模态时逐帧合成 + `pi.click` 自带行文本；按钮 `up =>` 同时渲染和响应、按下后全量重算再 diff、`dlg.ret`、`update`、`pi.onEmit`、`dialog_update.buttons`；删掉 `relabel` / `text` / `hint`，`panel.js` / `webpane.js` / 插件列表迁过去 | 150 | 200 | 滚轮手感和裸 `claude` 无差别（`--debug` 计时前后对比）；`panel.js` 一行单选只发 1 条 `dialog_update` |
+| **合计** | | ~2000（实际 P0–P5 已 ~4100） | ~1600（实际 ~2500） | |
 
 ## 风险和待确认
 
@@ -145,4 +187,6 @@ echo 'claude-p-w(){ BUFFER=claude-p; zle accept-line }; zle -N claude-p-w; bindk
 - **`/clear` 也会把 cwd 重置回启动目录**（已实测），所以先 `/clear` 再 `! cd`。
 - **`!` 命令执行完后 CC 会自动开始一轮模型调用**（已实测），cd 流程里由 wrapper 立刻 Esc 打断，仍会产生少量 token 消耗。
 - **allowedUrlPattern 需要 Chrome 149+**；不在白名单里的标签页会被 MCP 静默断开。
+- **CC 的 Ctrl+O transcript 视图是否吃 Ctrl+Home / PgDn 未实测**（P6）：先用 cc-probe 录 `.vt` 再写定位循环。
+- **网格懒喂后，读网格之前必须先喂完 pending**（P7）：`box()`、`snapshot`、`composeFrame`、`restoreCursor` 都要走同一个入口，漏一处就是读到旧帧。
 - ~~**构建尚未实测**~~：P0 已用 Zig 0.15.2 跑通 `zig build`（Linux 默认 musl，见 CLAUDE.md Gotchas）。ghostty-vt 固定在 v1.3.1（最后一个支持 0.15.2 的 tag）。

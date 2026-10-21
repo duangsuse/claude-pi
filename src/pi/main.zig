@@ -195,6 +195,8 @@ const Keys = struct {
     side: ?*sidecar_mod.Sidecar = null,
     /// The sidecar wants a `scr` message per dumped frame (pi.sed / scrcpy).
     scr_subscribed: bool = false,
+    /// A plugin registered pi.click: report plain clicks on the grid.
+    click_subscribed: bool = false,
     /// pi.title pushed the terminal's title (XTWINOPS 22) and owes a pop.
     title_pushed: bool = false,
     /// What plugins registered: `/name` commands, Tab prefixes, hooked
@@ -361,6 +363,17 @@ const Keys = struct {
             }
         }
         if (self.onDoubleClick(key)) return true;
+        // pi.click: a plain click above the input box names a grid row for
+        // the plugins (the box and the status line below it stay CC's).
+        if (self.click_subscribed and key == .mouse and key.mouse.press and key.mouse.button == 0) {
+            const y = key.mouse.y;
+            const in_box = if (self.box()) |b| blk: {
+                var bx = b;
+                defer bx.deinit(self.allocator);
+                break :blk y >= bx.top;
+            } else false;
+            if (!in_box) self.send(.{ .t = "click", .row = y });
+        }
         if (self.runner.active()) return false;
         return switch (key) {
             .tab => self.onTab(),
@@ -874,7 +887,10 @@ fn readClipboard(allocator: std.mem.Allocator) ?[]u8 {
 /// `id` on submit/press: reply {"t":"done","id"} once it has been typed.
 ///   {"t":"menu","id","items":[..]}  pi.menu
 ///   {"t":"paint","rows":[[row, text], ..]}  pi.sed results ("" blanks)
-///   {"t":"subscribe","scr":bool}
+///   {"t":"subscribe","scr":bool,"click":bool}
+///        scr: a {"t":"scr"} per frame; click: {"t":"click","row"} on a
+///        plain click above the input box (pi.click)
+///   {"t":"click","row":n}  a plain click on grid row n (0-based)
 /// Sidecar lines that arrive before the pty / Keys exist (plugin loading
 /// happens before claude starts; its pi.command names must reach the
 /// plugin dir in time). `ready` says host.js finished loading plugins.
@@ -1069,6 +1085,7 @@ fn onSidecarLine(keys: *Keys, line: []const u8) void {
         term.writeAll(stdout_fd, out.items);
     } else if (eql(u8, t, "subscribe")) {
         if (m.get("scr")) |v| keys.scr_subscribed = v == .bool and v.bool;
+        if (m.get("click")) |v| keys.click_subscribed = v == .bool and v.bool;
         // Dump right away instead of waiting for CC to draw something.
         sh.dirty.store(true, .seq_cst);
     }
@@ -1270,6 +1287,11 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
 
     const orig_termios = try term.enterRaw(stdin_fd);
     defer term.restore(stdin_fd, orig_termios);
+    // Focus reports (CSI I / CSI O) drive pi.tui.state.focused (herdry,
+    // notify). CC doesn't turn them on, so the wrapper does; turn them off
+    // again before restoring the terminal.
+    term.writeAll(stdout_fd, "\x1b[?1004h");
+    defer term.writeAll(stdout_fd, "\x1b[?1004l");
 
     const session = zmux.NativeSession.create(allocator, .{
         .id = "claude-p",

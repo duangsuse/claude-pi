@@ -77,7 +77,7 @@ runs the real `claude` binary.
 | `src/pi/steps.zig` | Non-blocking queue of pty writes + waits (cd flow). |
 | `src/pi/fzf.zig` | fzf on the real tty (main.zig pauses output, repaints from grid). |
 | `src/pi/overlay.zig` | Dialog / menu / row paints, appended after every CC chunk. |
-| `js/plugins/*.js` | Default plugins: `notify.js` (desktop notification), `herdry.js` (spinning tab title), `pace.js` (last ● duration + 3-minute cost, bottom-right snack). |
+| `js/plugins/*.js` | Default plugins: `notify.js` (desktop notification), `herdry.js` (spinning tab title), `pace.js` (last ● duration + 3-minute cost, bottom-right snack), `img.js` (click a `.png` / `.webp` row → `imv`). |
 | `js/rpc.js` | `pi` API + plugin registry (AsyncLocalStorage ownership, timer hooks, ◆ badge list). |
 | `js/stubs.js` | Plugin command stubs (`name:` alias + empty description) in the per-run `--plugin-dir`, so `pi.command` names appear in CC's `/` autocomplete (never the project's `.claude/`). |
 | `js/session.js` | Transcript cost / name, status-line parsing (effort, mode), Bash output rows. Prices from the claude-api skill. |
