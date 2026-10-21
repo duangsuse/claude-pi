@@ -10,17 +10,23 @@ test('lineSplitter handles split and batched chunks', () => {
   assert.deepEqual(lines, ['{"a":1}', '{"b":2}', '{"c":3}'])
 })
 
-test('pi`` submits the line (Enter is added on the Zig side)', async () => {
+test('pi`` submits the line and resolves when Zig says it was typed', async () => {
   const sent = []
-  const { pi } = createHost(m => sent.push(m))
+  const { pi, dispatch } = createHost(m => sent.push(m))
   const dir = '/tmp/x'
-  await pi`/add-dir ${dir}`
-  await pi`echo a\nb`
+  let typed = false
+  const p = pi`/add-dir ${dir}`.then(() => (typed = true))
+  pi`echo a\nb`
   // String.raw: the backslash sequence is not cooked.
   assert.deepEqual(sent, [
-    { t: 'submit', data: '/add-dir /tmp/x' },
-    { t: 'submit', data: 'echo a\\nb' },
+    { t: 'submit', data: '/add-dir /tmp/x', id: 1 },
+    { t: 'submit', data: 'echo a\\nb', id: 2 },
   ])
+  await new Promise(r => setImmediate(r))
+  assert.equal(typed, false)
+  dispatch({ t: 'done', id: 1 })
+  await p
+  assert.equal(typed, true)
 })
 
 test('pi.BUFFER is write-only', () => {
@@ -60,25 +66,25 @@ test('init and resize update state', () => {
   const { pi, dispatch } = createHost(() => {})
   dispatch({ t: 'init', cols: 80, rows: 24 })
   dispatch({ t: 'resize', cols: 100, rows: 30 })
-  assert.equal(pi.state.cols, 100)
-  assert.equal(pi.state.rows, 30)
+  assert.equal(pi.tui.state.cols, 100)
+  assert.equal(pi.tui.state.rows, 30)
 })
 
-test('dialog: buttons are one-arg callbacks; string relabels, void closes', async () => {
+test('dialog: buttons are no-arg callbacks; string relabels, void closes', async () => {
   const sent = []
   const { pi, dispatch } = createHost(m => sent.push(m))
   let checked = false
   const done = pi.dialog({
     title: 'T',
     body: 'first row\nsecond',
-    '[ ] web': row1 => ((checked = !checked), checked ? '[x] web' : '[ ] web'),
-    OK: row1 => {},
+    '[ ] web': () => ((checked = !checked), checked ? '[x] web' : '[ ] web'),
+    OK: () => {},
   })
-  assert.deepEqual(sent[0], { t: 'dialog', id: 1, title: 'T', body: 'first row\nsecond', footer: '', buttons: ['[ ] web', 'OK'], modal: true, vertical: false })
-  dispatch({ t: 'dialog_button', id: 1, index: 0, row1: 'first row' })
+  assert.deepEqual(sent[0], { t: 'dialog', id: 1, title: 'T', body: 'first row\nsecond', footer: '', buttons: ['[ ] web', 'OK'], modal: true, active: 0 })
+  dispatch({ t: 'dialog_button', id: 1, index: 0 })
   await new Promise(r => setImmediate(r))
   assert.deepEqual(sent[1], { t: 'dialog_update', id: 1, index: 0, label: '[x] web' })
-  dispatch({ t: 'dialog_button', id: 1, index: 1, row1: 'first row' })
+  dispatch({ t: 'dialog_button', id: 1, index: 1 })
   assert.equal(await done, 'OK')
   assert.deepEqual(sent[2], { t: 'dialog_close', id: 1 })
 })
@@ -106,7 +112,38 @@ test("sed: '' blanks, null leaves the row alone; only changes are sent", () => {
   assert.deepEqual(sent[1], { t: 'paint', rows: [[1, ''], [2, 'bar']] })
   dispatch(frame)
   assert.equal(sent.length, 2)
-  assert.equal(pi.state.scr.text, 'ok\nsecret 1\nfoo')
+  assert.equal(pi.tui.state.scr.text, 'ok\nsecret 1\nfoo')
+})
+
+test('tui.dispose runs when the plugin is turned off', async () => {
+  const host = createHost(() => {})
+  let disposed = 0
+  await host.loadPlugin('d.js', pi => pi.tui.dispose(() => disposed++))
+  await host.setEnabled('d.js', false)
+  assert.equal(disposed, 1)
+})
+
+test('pi.sh quotes interpolated values', async () => {
+  const lines = []
+  const { pi } = createHost(() => {}, () => {}, { sh: async line => (lines.push(line), { code: 0, stdout: 'ok', stderr: '' }) })
+  const evil = "x'; rm -rf ~; echo '"
+  const r = await pi.sh`echo ${evil} ${'a b'}`
+  assert.equal(r.stdout, 'ok')
+  assert.equal(lines[0], String.raw`echo 'x'\''; rm -rf ~; echo '\''' 'a b'`)
+})
+
+test('dialog handle: relabel any button, replace texts', () => {
+  const sent = []
+  const { pi } = createHost(m => sent.push(m))
+  const dlg = pi.dialog({ title: 't', '○ a': () => {}, '● b': () => {} })
+  dlg.relabel('○ a', '● a')
+  dlg.relabel(1, '○ b')
+  dlg.text({ body: 'picked a' })
+  assert.deepEqual(sent.slice(1), [
+    { t: 'dialog_update', id: 1, index: 0, label: '● a' },
+    { t: 'dialog_update', id: 1, index: 1, label: '○ b' },
+    { t: 'dialog_update', id: 1, body: 'picked a' },
+  ])
 })
 
 test('notify goes through the host io; focus is tracked', () => {
@@ -115,7 +152,7 @@ test('notify goes through the host io; focus is tracked', () => {
   pi.notify('hi')
   dispatch({ t: 'focus', focused: false })
   assert.deepEqual(notes, ['hi'])
-  assert.equal(pi.state.focused, false)
+  assert.equal(pi.tui.state.focused, false)
 })
 
 const tick = (ms = 0) => new Promise(r => setTimeout(r, ms))
@@ -177,27 +214,124 @@ test('non-modal dialog: timeout presses the `or` button', async () => {
   const sent = []
   const { pi } = createHost(m => sent.push(m))
   let got
-  const r = pi.dialog({ title: 'Saved', body: 'row one', timeout: 20, or: 'OK', OK: row1 => (got = row1) })
+  const r = pi.dialog({ title: 'Saved', body: 'row one', timeout: 20, or: 'OK', OK: () => (got = 'pressed') })
   assert.equal(sent[0].modal, false)
   assert.deepEqual(sent[0].buttons, ['OK']) // timeout / or are config, not buttons
   assert.equal(await r, 'OK')
-  assert.equal(got, 'row one')
+  assert.equal(got, 'pressed')
   assert.deepEqual(sent.at(-1), { t: 'dialog_close', id: 1 })
 
   const r2 = pi.dialog({ body: 'toast', timeout: 10 })
   assert.equal(await r2, null)
 })
 
-test('badge click lists plugins as a vertical dialog; a button toggles', async () => {
+test('badge click lists plugins one per row; a button toggles', async () => {
   const sent = []
   const host = createHost(m => sent.push(m))
   await host.loadPlugin('a.js', () => {})
   host.dispatch({ t: 'badge_click' })
   const d = sent.findLast(m => m.t === 'dialog')
-  assert.equal(d.vertical, true)
+  assert.equal(d.eachRow, 'vertical')
   assert.deepEqual(d.buttons, ['[x] a.js', 'Done'])
-  host.dispatch({ t: 'dialog_button', id: d.id, index: 0, row1: '' })
+  host.dispatch({ t: 'dialog_button', id: d.id, index: 0 })
   await tick()
   assert.deepEqual(sent.findLast(m => m.t === 'dialog_update'), { t: 'dialog_update', id: d.id, index: 0, label: '[ ] a.js' })
   assert.equal(host.plugins.get('a.js').enabled, false)
+})
+
+test('commands, completions and key hooks: registered with Zig, dropped with the plugin', async () => {
+  const sent = []
+  const host = createHost(m => sent.push(m))
+  const ran = []
+  await host.loadPlugin('cmds.js', pi => {
+    pi.command('ad', args => ran.push(args))
+    pi.complete('//', tok => [tok + 'a', tok + 'b'])
+    pi.on({ CtrlP: () => false, ShiftTab: () => {} })
+  })
+  assert.deepEqual(sent.findLast(m => m.t === 'commands'), { t: 'commands', names: ['ad'] })
+  assert.deepEqual(sent.findLast(m => m.t === 'completions'), { t: 'completions', prefixes: ['//'] })
+  assert.deepEqual(sent.findLast(m => m.t === 'keys'), { t: 'keys', names: ['CtrlP', 'ShiftTab'] })
+
+  host.dispatch({ t: 'command', name: 'ad', args: ' ~/x   y ' })
+  host.dispatch({ t: 'complete', id: 7, prefix: '//', token: '//gh' })
+  host.dispatch({ t: 'key', id: 8, name: 'CtrlP' })
+  host.dispatch({ t: 'key', id: 9, name: 'ShiftTab' })
+  await tick(5)
+  assert.deepEqual(ran, [['~/x', 'y']])
+  assert.deepEqual(sent.find(m => m.t === 'complete_result'), { t: 'complete_result', id: 7, items: ['//gha', '//ghb'] })
+  assert.deepEqual(sent.filter(m => m.t === 'key_result'), [
+    { t: 'key_result', id: 8, prevent: true },
+    { t: 'key_result', id: 9, prevent: false },
+  ])
+
+  await host.setEnabled('cmds.js', false)
+  assert.deepEqual(sent.findLast(m => m.t === 'commands'), { t: 'commands', names: [] })
+  assert.deepEqual(sent.findLast(m => m.t === 'completions'), { t: 'completions', prefixes: [] })
+  assert.deepEqual(sent.findLast(m => m.t === 'keys'), { t: 'keys', names: [] })
+})
+
+test('pi.tui.wait matches text or a predicate, times out with false; press sends a key', async () => {
+  const sent = []
+  const { pi, dispatch } = createHost(m => sent.push(m))
+  const w = pi.tui.wait('Yes, for this session', 500)
+  assert.deepEqual(sent.at(-1), { t: 'subscribe', scr: true })
+  dispatch({ t: 'scr', rows: ['nothing yet'], cursor: { row: 0, col: 0 } })
+  dispatch({ t: 'scr', rows: ['❯ 1. Yes, for this session'], cursor: { row: 0, col: 0 } })
+  assert.equal(await w, true)
+  assert.deepEqual(sent.at(-1), { t: 'subscribe', scr: false })
+  assert.equal(await pi.tui.wait(s => s.rows.length > 5, 20), false)
+  pi.tui.press('enter')
+  assert.deepEqual(sent.at(-1), { t: 'press', key: 'enter', id: 1 })
+})
+
+test('dialog eachRow passes through; focus starts true', () => {
+  const sent = []
+  const { pi } = createHost(m => sent.push(m))
+  assert.equal(pi.tui.state.focused, true)
+  pi.dialog({ title: 'Panel', a() {}, b() {}, c() {}, d() {}, eachRow: [2, 2] })
+  assert.deepEqual(sent[0].eachRow, [2, 2])
+  assert.deepEqual(sent[0].buttons, ['a', 'b', 'c', 'd'])
+})
+
+test('tui.title: tab backend gets the text; null restores the original once', async () => {
+  const sets = []
+  const tab = { get: async () => 'Shell #3', set: async t => sets.push(t) }
+  const { pi } = createHost(() => {}, () => {}, { tab: Promise.resolve(tab) })
+  await Promise.all([pi.tui.title('aaab'), pi.tui.title('aaac')])
+  await pi.tui.title(null)
+  await pi.tui.title(null) // nothing left to restore
+  assert.deepEqual(sets, ['aaab', 'aaac', 'Shell #3'])
+})
+
+test('tui.title without a tab backend uses the window title (OSC via Zig)', async () => {
+  const sent = []
+  const { pi } = createHost(m => sent.push(m))
+  await pi.tui.title('x')
+  await pi.tui.title(null)
+  assert.deepEqual(sent, [{ t: 'title', text: 'x' }, { t: 'title', text: null }])
+})
+
+test('toast: starts on `or`, ←/→ picks, timeout presses the pick; hints follow focus', async () => {
+  const sent = []
+  const { pi, dispatch } = createHost(m => sent.push(m))
+  const pressed = []
+  const r = pi.dialog({ body: 'keep?', timeout: 30, or: 'Keep', Keep: () => pressed.push('Keep'), Drop: () => pressed.push('Drop') })
+  assert.equal(sent[0].active, 0)
+  dispatch({ t: 'dialog_active', id: 1, index: 1 })
+  assert.equal(await r, 'Drop')
+  assert.deepEqual(pressed, ['Drop'])
+
+  pi.dialog({ footer: 'f', hints: { A: 'about A', B: 'about B' }, A() {}, B() {} })
+  const d = sent.findLast(m => m.t === 'dialog')
+  assert.equal(d.footer, 'about A')
+  dispatch({ t: 'dialog_active', id: d.id, index: 1 })
+  assert.deepEqual(sent.at(-1), { t: 'dialog_update', id: d.id, footer: 'about B' })
+})
+
+test('sed callbacks get the row index and all rows', () => {
+  const sent = []
+  const { pi, dispatch } = createHost(m => sent.push(m))
+  pi.sed((ln, i, rows) => (i > 0 && rows[i - 1] === 'hide next' ? '' : null))
+  dispatch({ t: 'scr', rows: ['hide next', 'secret', 'ok'], cursor: { row: 0, col: 0 } })
+  assert.deepEqual(sent.at(-1), { t: 'paint', rows: [[1, '']] })
 })

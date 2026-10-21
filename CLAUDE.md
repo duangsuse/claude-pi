@@ -75,7 +75,13 @@ runs the real `claude` binary.
 | `src/pi/steps.zig` | Non-blocking queue of pty writes + waits (cd flow). |
 | `src/pi/fzf.zig` | fzf on the real tty (main.zig pauses output, repaints from grid). |
 | `src/pi/overlay.zig` | Dialog / menu / row paints, appended after every CC chunk. |
-| `js/plugins/*.js` | Default plugins loaded by host.js (notify on Stop/Notification). |
+| `js/plugins/*.js` | Default plugins: `notify.js` (desktop notification), `herdry.js` (spinning tab title). |
+| `js/rpc.js` | `pi` API + plugin registry (AsyncLocalStorage ownership, timer hooks, ◆ badge list). |
+| `js/session.js` | Transcript cost / name, status-line parsing (effort, mode), Bash output rows. Prices from the claude-api skill. |
+| `js/plugins/panel.js` | Ctrl+P panel: rows of buttons (`eachRow [4,5,3,3,4]`), relabeled via the dialog handle once CC agrees. |
+| `js/tab.js` | Tab-title backends (Yakuake / Konsole / Guake over D-Bus) for `pi.tui.title`. |
+| `js/plugins/{add-dir,webpane,magpie}.js` | `/ad`, `/w` (+ `pi.ext.webpane`), `/m` (via `pi.sh`). Tests fake `pi`; don't run `/w` / `/m` for real in tests (npx server, desktop app). |
+| `goal-v1.ipynb` | `%%js` cell magic (stdlib CDP client, default :9229) + API examples. Agents test it against a sidecar on :9224. |
 | `src/pi/testdata/*.vt` | Raw CC output streams (100x30) replayed by screen/grid tests. |
 | `scripts/cc-probe.py` | Drive real CC through claude-p, record `.vt` + `scr` per step. |
 | `scripts/vt-view.mjs` | Page through `.vt` files (←/→) by replaying them. |
@@ -110,6 +116,8 @@ runs the real `claude` binary.
 - **Overlays never use DECSC/DECRC** (CC uses them); the cursor and SGR
   are put back from the grid (`Grid.restoreCursor`). Each CC chunk + the
   overlay go out in one `?2026` synchronized write.
+- **herdry renames real tabs** (Yakuake/Konsole/Guake over D-Bus). Tests
+  pass a fake `io.tab` to `createHost`; never call `pickTab()`'s `set` from a test.
 - **Tests that trigger Stop/Notification or Ctrl+Enter**: put fakes for
   `notify-send` / `wl-paste` first in PATH — otherwise you pop notifications
   on the user's desktop or submit their real clipboard to the model.

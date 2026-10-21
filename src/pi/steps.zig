@@ -24,6 +24,9 @@ pub const Step = union(enum) {
     /// Press Enter if the box still holds text: a suggestion popup took the
     /// first one.
     enter_if_text,
+    /// Tell the sidecar that everything queued before this ran (resolves
+    /// the promise pi`…` returned).
+    done: u32,
 };
 
 const settle_cap_ms: i64 = 3000;
@@ -65,7 +68,7 @@ pub const Runner = struct {
     /// Run as many steps as are ready. `env` provides:
     ///   write([]const u8) void, quietMs() i64, hasBox() bool, busy() bool,
     ///   commandRunning() bool, contains([]const u8) bool, clearBox() void,
-    ///   boxHasText() bool
+    ///   boxHasText() bool, done(u32) void
     pub fn tick(self: *Runner, env: anytype, now_ms: i64) void {
         while (self.queue.items.len > 0) {
             const head = self.queue.items[0];
@@ -97,6 +100,10 @@ pub const Runner = struct {
                 },
                 .enter_if_text => blk: {
                     if (env.boxHasText()) env.write("\r");
+                    break :blk true;
+                },
+                .done => |id| blk: {
+                    env.done(id);
                     break :blk true;
                 },
                 .interrupt => blk: {
@@ -151,6 +158,9 @@ const FakeEnv = struct {
     }
     fn boxHasText(_: *FakeEnv) bool {
         return false;
+    }
+    fn done(self: *FakeEnv, id: u32) void {
+        self.out.print(testing.allocator, "<done {d}>", .{id}) catch {};
     }
     fn contains(self: *FakeEnv, t: []const u8) bool {
         return std.mem.indexOf(u8, self.text, t) != null;

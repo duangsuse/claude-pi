@@ -29,14 +29,17 @@ npx cld-pi -r <id> "接着呢？"              # 在已有会话里以 -p 模式
 rc 文件。
 
 交互模式会强制 `/tui fullscreen`，并通过 `--settings` 注入 `Notification`、`Stop`、
-`SessionStart` 三个 hook。相关文件放在 `~/claude/-p/`：
+`SessionStart` 三个 hook；Stop / Notification 在终端没有焦点时弹桌面通知（`notify-send`），默认插件
+`herdry` 还会让 Yakuake / Konsole / Guake 的标签标题转起来（`✻ 消息`，其他终端改窗口标题），直到你切回来。相关文件放在 `~/claude/-p/`：
 
 | 文件 | 说明 |
 |---|---|
 | `scr` | 当前屏幕的纯文本快照，每帧刷新 |
 | `host.log` | node sidecar 的日志 |
 | `inspect` | sidecar 的 DevTools 地址 |
-| `*.js` | 你的插件（P3 起） |
+| `*.js` | 你的插件：`export default pi => { … }`（ES module） |
+
+右上角的 `◆ plugins n/m` 角标列出所有插件，点它可以关掉某个插件——它注册的监听、`pi.sed` 和定时器会一起撤掉。
 
 ## 按键
 
@@ -45,22 +48,55 @@ rc 文件。
 | `./…` + Tab | 用 fzf 选 CC 当前目录下的文件 → 插入 `@路径 `（ctrl-d：选该文件所在文件夹） |
 | `/~/…` + Tab | 同上，范围是 `~` |
 | Ctrl+C | 清掉光标所在行及下面的行，光标停在新的空行；输入框为空时交给 Claude Code 自己处理 |
-| 单行输入 `/~/目录` 后回车 | 不存在就创建 `~/目录`，在允许目录外就先 `/add-dir`，然后 `/clear`，再 `! cd` 过去 |
+| 用 Ctrl+C 退出 | **删除这次对话**（`~/.claude/projects/` 下的记录）；想保留就用 `/exit` 退出 |
+| Ctrl+Enter | 粘贴剪贴板并提交（终端需支持 kitty 键盘协议或 modifyOtherKeys） |
+| Ctrl+P | 设置面板：会话名和花费、model / effort / mode、file / web 权限、隐藏 Bash 输出、CtrlO / CtrlR / Undo / Copy |
+| 单行输入 `/~/名字` 后回车 | 创建 `~/claude/名字`，并把 `cd … && npx cld-pi` 复制到剪贴板，在新终端粘贴即可打开 |
+
+## 命令
+
+在输入框里单独一行输入；Claude Code 看不到这些行。
+
+| 命令 | |
+|---|---|
+| `/ad <目录>` | `/add-dir`（自动确认对话框），然后 `!tree -L 2 <目录>` |
+| `/w` | `:3001` 上的 cloudcli Web UI（没有服务就在后台启动），列出 localhost / 局域网 / tailscale 地址 |
+| `/m` | `~/.local/bin/magpie panel` |
+
+## 插件
+
+插件是放在 `~/claude/-p/` 的 ES module，默认导出一个接收 `pi` 的函数：
+
+```js
+// ~/claude/-p/hello.js
+export default pi => {
+  pi.command('hi', ([name = 'there']) => pi.dialog({ body: `hello ${name}`, timeout: 2000 }))
+  pi.complete('#', tok => ['#bug', '#feat', '#docs'].filter(t => t.startsWith(tok)))
+  pi.on({ CtrlG: () => (pi.BUFFER = 'git status', false) })   // 返回 false：不走默认行为
+  setInterval(() => {}, 60_000)                                 // 插件被关掉时自动清除
+}
+```
 
 ## 调试插件（F12）
+
+[goal-v1.ipynb](./goal-v1.ipynb)：Jupyter 的 `%%js` magic，通过 CDP :9229 在你的会话里执行代码，附整套接口示例。
 
 node sidecar 默认开启 inspector，监听 `127.0.0.1:9229`（被占用时换随机端口，地址见
 `~/claude/-p/inspect`）。打开 `chrome://inspect` → *inspect*，就能直接使用全局变量 `pi`：
 
 ```js
-pi`/help`            // 往 Claude Code 里打一行并回车
-pi.BUFFER = '草稿'    // 替换输入框内容，不回车（只写）
-pi.arg.fzf = "--pointer '▶' --height=60%"   // Tab 补全用的 fzf 参数
-await pi.on.stop      // 等下一次 Stop hook
+pi`/help`            // type a line into Claude Code + Enter
+pi.BUFFER = 'draft'  // replace the input box text, no Enter (write-only)
+pi.BUFFER=await pi.menu('abc'.split(''))
+
+pi.arg.fzf = "--pointer '▶' --height=60%"   // fzf options for Tab completion
+await pi.dialog({ title: 'Hi', body: 'gum-style', OK: () => {}, Stat: () => pi`/status` })
+pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // 非模态，显示在右上角
+pi.sed(ln => ln.includes('secret') ? '' : null)   // blank / rewrite screen rows
+await pi.on.stop      // wait for the next Stop hook
 ```
 
-`CLAUDE_P_INSPECT=0` 关闭，`CLAUDE_P_INSPECT=<端口>` 指定端口。本机任何能连到这个端口的
-程序都能以你的身份执行代码，多人共用的机器上请关掉。
+`CLAUDE_P_INSPECT=<端口>` 指定端口，0关掉共享。
 
 ## 路线图
 
@@ -68,9 +104,9 @@ await pi.on.stop      // 等下一次 Stop hook
 |---|---|---|
 | P0 | 透传、ghostty-vt 网格、`scr`、hook、node sidecar | ✅ 完成 |
 | P1 | 识别输入框、`./` `/~/` 补全、Ctrl+C、输入路径即 `cd` | ✅ 完成 |
-| P2 | 叠加层（菜单 / dialog / 涂抹）、Ctrl+Enter、`notify-send` | |
-| P3 | 插件 API，`/m` `/w` `/ad` | |
-| P4 | Ctrl+P 设置面板 | |
+| P2 | 叠加层（菜单 / dialog / 涂抹）、Ctrl+Enter、`notify-send` | ✅ 完成 |
+| P3 | 插件 API，`/m` `/w` `/ad` | ✅ 完成 |
+| P4 | Ctrl+P 设置面板 | ✅ 完成 |
 | P5 | Chrome 标签页：`//` 截图、`//gh/` 补全 URL、WebMCP | |
 | P6 | 会话目录 WebUI | |
 

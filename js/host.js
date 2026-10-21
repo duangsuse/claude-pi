@@ -8,6 +8,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createHost, lineSplitter } from './rpc.js'
+import { pickTab } from './tab.js'
 
 const dataDir = process.env.CLAUDE_P_DIR || join(homedir(), 'claude', '-p')
 mkdirSync(dataDir, { recursive: true })
@@ -30,8 +31,21 @@ const notify = msg => {
   p.unref()
 }
 
+// pi.sh: one shell line. Resolves at the shell's exit (plus a moment for
+// output to drain) so `cmd &` doesn't hold it up.
+const sh = line =>
+  new Promise(resolve => {
+    const p = spawn('/bin/sh', ['-c', line], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    p.stdout.on('data', d => (stdout += d))
+    p.stderr.on('data', d => (stderr += d))
+    p.on('error', e => resolve({ code: 127, stdout, stderr: String(e) }))
+    p.on('exit', code => setTimeout(() => resolve({ code: code ?? 1, stdout, stderr }), 50))
+  })
+
 const send = msg => process.stdout.write(JSON.stringify(msg) + '\n')
-const host = createHost(send, log, { notify })
+const host = createHost(send, log, { notify, sh, tab: pickTab() })
 const { pi, dispatch } = host
 // Timers plugins create are charged to them (cleared when turned off).
 host.installTimerHooks()

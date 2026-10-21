@@ -47,3 +47,41 @@ pub fn pickPath(allocator: std.mem.Allocator, dir: []const u8, query: []const u8
     if (line.len == 0) return null;
     return try std.fs.path.resolve(allocator, &.{ dir, line });
 }
+
+/// Let the user pick one of `items` (a plugin's completion candidates).
+/// Returns the chosen line, or null on Esc / no fzf.
+pub fn pickLine(allocator: std.mem.Allocator, items: []const []const u8, query: []const u8, extra: []const u8) !?[]u8 {
+    const cmd = try std.fmt.allocPrint(
+        allocator,
+        "exec fzf --height=40% --min-height=8 {s} --query=\"$1\"",
+        .{extra},
+    );
+    defer allocator.free(cmd);
+    const argv = [_][]const u8{ "/bin/sh", "-c", cmd, "sh", query };
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+    child.spawn() catch return null;
+    // fzf reads the list from stdin and the keyboard from /dev/tty.
+    for (items) |it| {
+        child.stdin.?.writeAll(it) catch break;
+        child.stdin.?.writeAll("\n") catch break;
+    }
+    child.stdin.?.close();
+    child.stdin = null;
+
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = child.stdout.?.read(&buf) catch break;
+        if (n == 0) break;
+        try out.appendSlice(allocator, buf[0..n]);
+    }
+    const res = child.wait() catch return null;
+    if (res != .Exited or res.Exited != 0) return null;
+    const line = std.mem.trimRight(u8, out.items, "\r\n");
+    if (line.len == 0) return null;
+    return try allocator.dupe(u8, line);
+}

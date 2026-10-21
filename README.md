@@ -31,7 +31,9 @@ shell to `claude-p`. Nothing is written to your rc files for you.
 
 Interactive mode forces `/tui fullscreen` and registers `Notification`,
 `Stop` and `SessionStart` hooks through `--settings`; Stop / Notification
-pop a desktop notification (`notify-send`) when the terminal isn't focused. It keeps its files in
+pop a desktop notification (`notify-send`) when the terminal isn't focused, and the
+default `herdry` plugin spins the tab title (`✻ message`) in Yakuake / Konsole / Guake
+(window title elsewhere) until you focus it. It keeps its files in
 `~/claude/-p/`:
 
 | File | What |
@@ -39,7 +41,10 @@ pop a desktop notification (`notify-send`) when the terminal isn't focused. It k
 | `scr` | Plain-text dump of the current screen, refreshed every frame |
 | `host.log` | Log of the node sidecar |
 | `inspect` | DevTools URL of the sidecar |
-| `*.js` | Your plugins (from P3) |
+| `*.js` | Your plugins: `export default pi => { … }` (ES module) |
+
+The `◆ plugins n/m` badge in the top-right corner lists every plugin; click it
+to turn one off — its listeners, `pi.sed`s and timers go away with it.
 
 ## Keys
 
@@ -49,9 +54,33 @@ pop a desktop notification (`notify-send`) when the terminal isn't focused. It k
 | `/~/…` + Tab | same, under `~` |
 | Ctrl+C | clears the caret's line and the lines below, caret stays on a fresh line; empty box → Claude Code's own Ctrl+C |
 | Ctrl+Enter | paste the clipboard and submit (needs a kitty-protocol or modifyOtherKeys terminal) |
+| Ctrl+P | settings panel: session name + cost, model / effort / mode, file / web permissions, hide Bash output, CtrlO / CtrlR / Undo / Copy |
 | quitting with Ctrl+C | **deletes that conversation** from `~/.claude/projects/` (quit with `/exit` to keep it) |
-| Ctrl+Enter | paste the clipboard and submit (needs a kitty-protocol or modifyOtherKeys terminal) |
 | Enter on a single line `/~/name` | creates `~/claude/name` and copies `cd … && npx cld-pi` to paste in a new terminal |
+
+## Commands
+
+Typed as a single line in the input box; Claude Code never sees them.
+
+| Command | |
+|---|---|
+| `/ad <dir>` | `/add-dir` it (confirms the dialog), then `!tree -L 2 <dir>` |
+| `/w` | cloudcli web UI on `:3001` (started in the background if nothing serves it); shows localhost / LAN / tailscale URLs |
+| `/m` | `~/.local/bin/magpie panel` |
+
+## Plugins
+
+A plugin is an ES module in `~/claude/-p/` exporting a function of `pi`:
+
+```js
+// ~/claude/-p/hello.js
+export default pi => {
+  pi.command('hi', ([name = 'there']) => pi.dialog({ body: `hello ${name}`, timeout: 2000 }))
+  pi.complete('#', tok => ['#bug', '#feat', '#docs'].filter(t => t.startsWith(tok)))
+  pi.on({ CtrlG: () => (pi.BUFFER = 'git status', false) })   // false: skip the default
+  setInterval(() => {}, 60_000)                                 // cleared when turned off
+}
+```
 
 ## Debugging plugins (F12)
 
@@ -66,13 +95,14 @@ pi.BUFFER=await pi.menu('abc'.split(''))
 
 pi.arg.fzf = "--pointer '▶' --height=60%"   // fzf options for Tab completion
 await pi.dialog({ title: 'Hi', body: 'gum-style', OK: () => {}, Stat: () => pi`/status` })
+pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // non-modal, top-right
 pi.sed(ln => ln.includes('secret') ? '' : null)   // blank / rewrite screen rows
 await pi.on.stop      // wait for the next Stop hook
 ```
 
 `CLAUDE_P_INSPECT=9223` picks another port. (0=OFF).
 
-> [Refer this](./goal-v1.ts) for more
+> [Refer this](./goal-v1.ts) for more · [goal-v1.ipynb](./goal-v1.ipynb): a `%%js` Jupyter magic that runs these against your session (CDP :9229), with examples
 
 ## Roadmap
 
@@ -81,8 +111,8 @@ await pi.on.stop      // wait for the next Stop hook
 | P0 | Passthrough, ghostty-vt grid, `scr`, hooks, node sidecar | ✅ done |
 | P1 | Input box detection, `./` `/~/` completion, Ctrl+C, path → `cd` | ✅ done |
 | P2 | Overlays (menu / dialog / paint), Ctrl+Enter, `notify-send` | ✅ done |
-| P3 | Plugin API, `/m` `/w` `/ad` | |
-| P4 | Ctrl+P settings panel | |
+| P3 | Plugin API, `/m` `/w` `/ad` | ✅ done |
+| P4 | Ctrl+P settings panel | ✅ done |
 | P5 | Chrome tabs: `//` screenshot, `//gh/` URLs, WebMCP | |
 | P6 | Conversation outline WebUI | |
 

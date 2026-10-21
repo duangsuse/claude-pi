@@ -20,8 +20,9 @@ pub const Dialog = struct {
     footer: []u8,
     buttons: [][]u8,
     active: usize = 0,
-    /// One button per row (lists, e.g. the plugin list).
-    vertical: bool = false,
+    /// `eachRow`: buttons per row (owned; the last count repeats). Empty:
+    /// all on one row. All ones: a list (full-width rows).
+    layout: []u8 = &.{},
 
     fn deinit(self: *Dialog, a: std.mem.Allocator) void {
         a.free(self.title);
@@ -29,12 +30,55 @@ pub const Dialog = struct {
         a.free(self.footer);
         for (self.buttons) |b| a.free(b);
         a.free(self.buttons);
+        a.free(self.layout);
     }
 
-    /// First body line: what button callbacks receive as `row1`.
-    pub fn row1(self: *const Dialog) []const u8 {
-        var it = std.mem.splitScalar(u8, self.body, '\n');
-        return it.first();
+    pub const Span = struct { start: usize, len: usize };
+    pub const max_rows = 64;
+
+    /// Which buttons sit on which row.
+    pub fn rows(self: *const Dialog, buf: *[max_rows]Span) []Span {
+        const n = self.buttons.len;
+        if (n == 0) return buf[0..0];
+        if (self.layout.len == 0) {
+            buf[0] = .{ .start = 0, .len = n };
+            return buf[0..1];
+        }
+        var i: usize = 0;
+        var k: usize = 0;
+        while (i < n and k < max_rows) : (k += 1) {
+            const c = @max(1, self.layout[@min(k, self.layout.len - 1)]);
+            buf[k] = .{ .start = i, .len = @min(c, n - i) };
+            i += buf[k].len;
+        }
+        return buf[0..k];
+    }
+
+    fn isList(self: *const Dialog, spans: []const Span) bool {
+        if (self.layout.len == 0 or spans.len < 2) return false;
+        for (spans) |sp| if (sp.len != 1) return false;
+        return true;
+    }
+
+    pub const Move = enum { prev, next, up, down };
+
+    /// ←/→/Tab walk the buttons in order; ↑/↓ change row, keeping the column.
+    pub fn move(self: *Dialog, dir: Move) void {
+        const n = self.buttons.len;
+        if (n == 0) return;
+        switch (dir) {
+            .prev => self.active = (self.active + n - 1) % n,
+            .next => self.active = (self.active + 1) % n,
+            .up, .down => {
+                var buf: [max_rows]Span = undefined;
+                const spans = self.rows(&buf);
+                var r: usize = 0;
+                while (r + 1 < spans.len and self.active >= spans[r + 1].start) r += 1;
+                const col = self.active - spans[r].start;
+                const to = if (dir == .up) (r + spans.len - 1) % spans.len else (r + 1) % spans.len;
+                self.active = spans[to].start + @min(col, spans[to].len - 1);
+            },
+        }
     }
 };
 
@@ -197,12 +241,25 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *const Dialog,
     var body_it = std.mem.splitScalar(u8, d.body, '\n');
     if (d.body.len > 0) while (body_it.next()) |l| try lines.append(a, .{ .text = l, .style = "" });
 
-    // Horizontal: one row, right-aligned like gum confirm. Vertical: one
-    // full-width row per button, like a list.
+    // One row: right-aligned like gum confirm. A list (eachRow 'vertical'):
+    // full-width rows. A grid (eachRow [4, 5, 3]): every row spans the full
+    // width, its buttons sharing it equally, so rows of 3 and 5 balance.
+    var span_buf: [Dialog.max_rows]Dialog.Span = undefined;
+    const spans = d.rows(&span_buf);
+    const list = d.isList(spans);
+    const grid = spans.len > 1 and !list;
     var btn_w: usize = 0;
-    for (d.buttons) |b| btn_w = if (d.vertical) @max(btn_w, width(b) + 2) else btn_w + width(b) + 4;
-    if (!d.vertical) btn_w -|= 2;
-    const btn_rows: usize = if (d.buttons.len == 0) 0 else if (d.vertical) d.buttons.len else 1;
+    for (spans) |sp| {
+        var row_w: usize = 0;
+        var widest: usize = 0;
+        for (d.buttons[sp.start..][0..sp.len]) |b| {
+            row_w += width(b) + 4;
+            widest = @max(widest, width(b) + 2);
+        }
+        // A justified row needs room for n cells as wide as its widest label.
+        btn_w = @max(btn_w, if (grid) widest * sp.len + 2 * (sp.len - 1) else row_w -| 2);
+    }
+    const btn_rows: usize = spans.len;
 
     var inner: usize = btn_w;
     for (lines.items) |l| inner = @max(inner, width(l.text));
@@ -239,24 +296,40 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *const Dialog,
             try repeat(a, out, " ", inner);
             try sideClose(a, out);
         }
-        if (d.vertical) {
-            for (d.buttons, 0..) |b, i| {
-                y += 1;
-                try sideOpen(a, out, y, x0);
-                try out.appendSlice(a, if (i == d.active) btn_on else btn_off);
-                try padded(a, out, b, inner, 1);
-                try sideClose(a, out);
-            }
-        } else {
+        for (spans) |sp| {
             y += 1;
             try sideOpen(a, out, y, x0);
-            try repeat(a, out, " ", inner -| btn_w);
-            for (d.buttons, 0..) |b, i| {
-                if (i > 0) try out.appendSlice(a, "  ");
-                try out.appendSlice(a, if (i == d.active) btn_on else btn_off);
-                try out.appendSlice(a, " ");
-                try truncate(a, out, b, inner);
-                try out.appendSlice(a, " " ++ reset);
+            if (list) {
+                try out.appendSlice(a, if (sp.start == d.active) btn_on else btn_off);
+                try padded(a, out, d.buttons[sp.start], inner, 1);
+            } else if (grid) {
+                // Equal cells across the full width, labels centered.
+                const gaps = 2 * (sp.len - 1);
+                const cell = (inner -| gaps) / sp.len;
+                var spare = (inner -| gaps) - cell * sp.len;
+                var used: usize = 0;
+                for (d.buttons[sp.start..][0..sp.len], 0..) |b, j| {
+                    if (j > 0) {
+                        try out.appendSlice(a, "  ");
+                        used += 2;
+                    }
+                    const w = cell + @as(usize, if (spare > 0) 1 else 0);
+                    spare -|= 1;
+                    const lead = (w -| @min(width(b), w)) / 2;
+                    try out.appendSlice(a, if (sp.start + j == d.active) btn_on else btn_off);
+                    try padded(a, out, b, w, lead);
+                    try out.appendSlice(a, reset);
+                    used += w;
+                }
+                try repeat(a, out, " ", inner -| used);
+            } else {
+                try repeat(a, out, " ", inner -| btn_w);
+                for (d.buttons[sp.start..][0..sp.len], 0..) |b, j| {
+                    if (j > 0) try out.appendSlice(a, "  ");
+                    try out.appendSlice(a, if (sp.start + j == d.active) btn_on else btn_off);
+                    try padded(a, out, b, width(b) + 2, 1);
+                    try out.appendSlice(a, reset);
+                }
             }
             try sideClose(a, out);
         }
@@ -349,7 +422,6 @@ test "dialog renders a centered box over the grid" {
     var o: Overlay = .{ .allocator = testing.allocator };
     defer o.deinit();
     o.openDialog(testDialog(&.{ "OK", "Cancel" }));
-    try testing.expectEqualStrings("row one", o.dialog.?.row1());
 
     var out: std.ArrayList(u8) = .{};
     defer out.deinit(testing.allocator);
@@ -416,7 +488,7 @@ test "vertical buttons, toast placement and the badge" {
     var o: Overlay = .{ .allocator = testing.allocator };
     defer o.deinit();
     var d = testDialog(&.{ "[x] notify.js", "[ ] mine.js" });
-    d.vertical = true;
+    d.layout = try testing.allocator.dupe(u8, &.{1});
     o.openDialog(d);
     const t = testDialog(&.{});
     o.openToast(.{ .id = 9, .title = t.title, .body = t.body, .footer = t.footer, .buttons = t.buttons });
@@ -453,4 +525,85 @@ test "vertical buttons, toast placement and the badge" {
 
     o.closeById(9);
     try testing.expect(o.toast == null and o.dialog != null);
+}
+
+test "eachRow [3,5]: rows are justified to the same width" {
+    var o: Overlay = .{ .allocator = testing.allocator };
+    defer o.deinit();
+    var d = testDialog(&.{ "plan", "norm", "auto", "low", "medium", "high", "xhigh", "max" });
+    d.layout = try testing.allocator.dupe(u8, &.{ 3, 5 });
+    o.openDialog(d);
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(testing.allocator);
+    try o.render(&out, 80, 20);
+    const g = try Grid.create(testing.allocator, 80, 20);
+    defer g.destroy(testing.allocator);
+    g.feed(out.items);
+    // Both rows: first cell starts right after "│ ", last one ends right
+    // before " │" — same span.
+    var first: [2]usize = undefined;
+    var last: [2]usize = undefined;
+    for ([_][]const u8{ "plan", "low" }, [_][]const u8{ "auto", "max" }, 0..) |l, r, k| {
+        var y: usize = 0;
+        while (y < 20) : (y += 1) {
+            const row = try rowString(g, y);
+            defer testing.allocator.free(row);
+            if (std.mem.indexOf(u8, row, l) != null and std.mem.indexOf(u8, row, r) != null) {
+                first[k] = buttonStart(g, y);
+                last[k] = buttonEnd(g, y);
+            }
+        }
+    }
+    try testing.expectEqual(first[0], first[1]);
+    try testing.expectEqual(last[0], last[1]);
+}
+
+fn rowString(g: *Grid, y: usize) ![]u8 {
+    const s = try g.snapshot(testing.allocator);
+    defer testing.allocator.free(s);
+    var it = std.mem.splitScalar(u8, s, '\n');
+    var i: usize = 0;
+    while (it.next()) |l| : (i += 1) if (i == y) return testing.allocator.dupe(u8, l);
+    return testing.allocator.dupe(u8, "");
+}
+
+/// First / last column on row y whose cell has a background color (a button).
+fn buttonStart(g: *Grid, y: usize) usize {
+    for (0..g.term.cols) |x| if (hasBg(g, x, y)) return x;
+    return 0;
+}
+
+fn buttonEnd(g: *Grid, y: usize) usize {
+    var x: usize = g.term.cols;
+    while (x > 0) {
+        x -= 1;
+        if (hasBg(g, x, y)) return x;
+    }
+    return 0;
+}
+
+fn hasBg(g: *Grid, x: usize, y: usize) bool {
+    const c = g.term.screens.active.pages.getCell(.{ .active = .{ .x = @intCast(x), .y = @intCast(y) } }) orelse return false;
+    return c.style().bg_color != .none;
+}
+
+test "eachRow [2,2]: arrows move across rows" {
+    var o: Overlay = .{ .allocator = testing.allocator };
+    defer o.deinit();
+    var d = testDialog(&.{ "model", "effort", "plan", "web" });
+    d.layout = try testing.allocator.dupe(u8, &.{ 2, 2 });
+    o.openDialog(d);
+    const dd = &o.dialog.?;
+    var buf: [Dialog.max_rows]Dialog.Span = undefined;
+    try testing.expectEqual(@as(usize, 2), dd.rows(&buf).len);
+
+    dd.move(.down);
+    try testing.expectEqual(@as(usize, 2), dd.active); // model -> plan
+    dd.move(.next);
+    try testing.expectEqual(@as(usize, 3), dd.active); // web
+    dd.move(.up);
+    try testing.expectEqual(@as(usize, 1), dd.active); // effort
+    dd.move(.down);
+    dd.move(.down); // wraps to the first row
+    try testing.expectEqual(@as(usize, 1), dd.active);
 }

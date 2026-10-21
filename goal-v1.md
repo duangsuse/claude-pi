@@ -57,12 +57,19 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
 - 「显示 bash 输出」开关：关掉后由 wrapper 在网格中识别 Bash 工具块，用背景色涂掉
 - 底部四个按钮，active时显示Hint：CtrlO（transcript）、CtrlR（历史搜索）、Undo（Esc Esc 回退）、Copy 回复（`/copy`）
 
+实现说明（`js/plugins/panel.js`，数据解析在 `js/session.js`）：
+- 全部是按钮，每行横向均分：`eachRow: [4,5,3,3,4]` = model（haiku sonnet opus fable）/ effort（low…max）/ mode（plan norm auto）三行单选（`● 当前` `○ 其他`，用 `{...Object.fromEntries(list.map(…))}` 生成），file / web / bash 三个复选框，CtrlO / CtrlR / Undo / Copy；聚焦时 footer 显示 hint。单选确认后通过 dialog 句柄 `relabel` 整行改字。
+- model 用 CC 的别名 `/model haiku|sonnet|opus|fable`（跟随用户自己的模型配置），等到屏幕出现 "Set model to …" 才更新标签。
+- effort 用 `/effort <级别>`，从状态栏 `◐ medium · /effort` 读回；CC 若弹出滑条则按 ←/→ 走过去再回车。
+- mode：CC 的循环是 auto → manual → accept edits → plan；面板的 norm = manual，按 Shift+Tab 直到状态栏读到目标档。
+- 花费：transcript 中 assistant 消息按 id 去重后按价目表计算（1.25×/2× 写缓存、按模型的读缓存价、Opus 5.5 fast 模式）；session 名取 custom-title，否则 ai-title。
+
 ### 伪命令（默认插件，用 JS API 实现）
 | 命令 | 实现 |
 |---|---|
-| `/m` | 启动 `~/.local/bin/magpie panel` |
-| `/w` | 如果:3001没有，后台运行 `npx @cloudcli-ai/cloudcli`，像 http-server 那样在 dialog 里列出 局域网 IP 和 tailscale 地址、localhost |
-| `/ad X` | `/add-dir X`，然后 `!tree -L 2 X` |
+| `/m` | `pi.sh` 启动 `~/.local/bin/magpie panel`；找不到就弹窗，OK 复制安装命令 `curl -fsSL https://usemagpie.ai/install.sh \| sh` |
+| `/w`（`webpane.js`，同时发布 `pi.ext.webpane`） | 如果:3001没有，后台运行 `npx @cloudcli-ai/cloudcli`，像 http-server 那样在 dialog 里列出 局域网 IP 和 tailscale 地址、localhost |
+| `/ad X` | `/add-dir X`（等到 "Yes, for this session" 就回车确认），然后 `!tree -L 2 X` |
 | `/o` | 打开概览 WebUI（见下） |
 
 插件 API 草案见 [`goal-v1.ts`](./goal-v1.ts)（仅作文档，不做类型检查）。
@@ -85,6 +92,8 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
 ### 事件
 - 用 `--settings` 内联注入 Notification、Stop、SessionStart hook，沿用原项目的 FIFO 机制。
 - Notification 和 Stop 事件 → `notify-send`；事件同时转发给插件的 `pi.on`。由默认插件 `js/plugins/notify.js` 实现：终端有焦点时（CC 打开了焦点上报 `?1004`）不弹。
+- 默认插件 `js/plugins/herdry.js`：`pi.notify` 时把标签标题换成 CC 风格的旋转字符 + 消息（`·✢*✶✻✽✻✶*✢`），直到终端获得焦点再恢复。Yakuake 用 `setTabTitle`（Konsole 会话 `/Sessions/N` 对应 Yakuake 终端 N-1，并核对 D-Bus 名字的 owner），Konsole 用 `Session.setTitle(1)`，Guake 用 `rename_tab_uuid($GUAKE_TAB_UUID)`，其他终端用 OSC 2 窗口标题。
+- 插件列表：右上角 `◆ plugins n/m` 角标，鼠标点击（SGR 鼠标上报）打开一行一个按钮的 dialog（`eachRow: 'vertical'`），Enter 开关某个插件；关闭即撤销它的 pi.on / pi.sed / 定时器（宿主 hook 了 setInterval / setTimeout）。
 
 ### 首次运行
 检测到 `~/claude/-p/.installed` 不存在时，打印一条命令让用户自己执行（只打印，不自动修改 rc）：
@@ -101,8 +110,8 @@ echo 'claude-p-w(){ BUFFER=claude-p; zle accept-line }; zle -N claude-p-w; bindk
 | **P0 底座** ✅ | fork；0 参数进入 `src/pi/`；raw 模式双向透传；SIGWINCH；ghostty-vt；每帧写 `scr`；强制 fullscreen；首次运行打印 rc 命令；node sidecar 和 RPC 骨架；打包流程加入 `js/` | 450 | 120 | `claude-p` 打开后和直接运行 `claude` 体验一致，`scr` 内容和屏幕一致 |
 | **P1 输入核心** ✅ 待手测 | 识别输入框（边框、占位符的灰色 SGR）；Ctrl+C 两种语义；Tab 前缀路由，fzf 在真实 tty 运行后按网格重绘；`./`、`/~/` 补全插入 `@`；只输路径时回车 cd，不存在则新建，之后 `/clear` | 400 | 120 | 补全、清行、cd 三个场景各手测 10 次无错乱 |
 | **P2 叠加层和按键** ✅ 待手测 | gum 风格的下拉菜单、dialog、涂抹层（同步输出，CC 每帧画完后重新涂）；kitty 键盘协议；Ctrl+Enter 粘贴执行；hook 事件接 notify-send | 500 | 60 | CC 正在流式输出时打开 dialog 不闪烁，关闭后画面完全恢复 |
-| **P3 插件系统和默认插件** | 插件 API；加载 `~/claude/-p/*.js`；`/m`、`/w`、`/ad` | 150 | 350 | 写一个用户插件能自动加载，3 个默认命令都能用 |
-| **P4 Ctrl+P 面板** | 按钮；session 名和花费；bash 输出涂抹开关；基于 pi.dialog({}) 的面板 | 350 | 250 | 每个控件都和 CC 实际状态同步（改完后从状态栏读回来核对） |
+| **P3 插件系统和默认插件** ✅ 待手测 | 插件 API；加载 `~/claude/-p/*.js`；`/m`、`/w`、`/ad` | 150 | 350 | 写一个用户插件能自动加载，3 个默认命令都能用 |
+| **P4 Ctrl+P 面板** ✅ 待手测 | 按钮；session 名和花费；bash 输出涂抹开关；基于 pi.dialog({}) 的面板 | 350 | 250 | 每个控件都和 CC 实际状态同步（改完后从状态栏读回来核对） |
 | **P5 浏览器** | 预检查；`//` 选标签页截图；`//gh/` 补全；维护 `~/.F12-mcp.json`；提示 MCP 安装命令 | 50 | 350 | 能选中标签页截图并插入 `@png`，Claude 能读到 |
 | **P6 概览 WebUI** | JSONL 转目录；chrome app 小窗口；进 Ctrl+O，按 Ctrl+Home 跳到顶部，然后一边 PgDn 一边 poll | 100 | 350 | 50 轮的会话里点任意一条都能定位到 |
 | **合计** | | ~2000 | ~1600 | |

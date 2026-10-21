@@ -18,6 +18,8 @@ pub const Key = union(enum) {
     focus_in,
     focus_out,
     char: u21,
+    /// Ctrl + a letter other than c (lowercase letter).
+    ctrl: u8,
     /// SGR mouse report (CC turns on ?1006). x/y are 0-based cells.
     mouse: Mouse,
     other,
@@ -53,6 +55,7 @@ pub fn decode(bytes: []const u8) Key {
         0x1b => .esc,
         0x7f, 0x08 => .backspace,
         0x20...0x7e => .{ .char = bytes[0] },
+        0x01...0x02, 0x04...0x07, 0x0a...0x0c, 0x0e...0x1a => .{ .ctrl = bytes[0] - 1 + 'a' },
         else => .other,
     };
     if (bytes[0] != 0x1b) {
@@ -119,7 +122,37 @@ pub fn decode(bytes: []const u8) Key {
         27 => .esc,
         127 => .backspace,
         'c' => if (ctrl) .ctrl_c else .{ .char = 'c' },
+        'a'...'b', 'd'...'z' => if (ctrl) .{ .ctrl = @intCast(code) } else .{ .char = @intCast(code) },
         else => if (!ctrl and code >= 0x20 and code <= 0x10FFFF) .{ .char = @intCast(code) } else .other,
+    };
+}
+
+/// The last focus report (`CSI I` in, `CSI O` out) anywhere in a stdin
+/// chunk. They often arrive glued to mouse reports (CC turns on ?1003 any-
+/// motion tracking), so `decode` alone misses them.
+pub fn lastFocus(bytes: []const u8) ?bool {
+    var res: ?bool = null;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, i, "\x1b[")) |at| {
+        if (at + 2 < bytes.len) switch (bytes[at + 2]) {
+            'I' => res = true,
+            'O' => res = false,
+            else => {},
+        };
+        i = at + 2;
+    }
+    return res;
+}
+
+/// The name plugins hook a key by (`pi.on({ CtrlP() {} })`): Ctrl / Shift
+/// combinations only. Writes into `buf`.
+pub fn hookName(key: Key, buf: []u8) ?[]const u8 {
+    return switch (key) {
+        .ctrl_c => "CtrlC",
+        .ctrl_enter => "CtrlEnter",
+        .shift_tab => "ShiftTab",
+        .ctrl => |c| std.fmt.bufPrint(buf, "Ctrl{c}", .{std.ascii.toUpper(c)}) catch null,
+        else => null,
     };
 }
 
@@ -278,9 +311,22 @@ test "decode legacy, kitty CSI-u and modifyOtherKeys" {
     try t.expectEqual(Key.other, decode("\x1b[13;3u")); // alt+enter
     try t.expectEqual(Key.other, decode("a\t"));
     try t.expectEqual(Key.other, decode("\x1b[200~\t\x1b[201~"));
+    try t.expectEqual(Key{ .ctrl = 'p' }, decode("\x10"));
+    try t.expectEqual(Key{ .ctrl = 'p' }, decode("\x1b[112;5u"));
+    try t.expectEqual(Key{ .ctrl = 'p' }, decode("\x1b[27;5;112~"));
+    var buf: [16]u8 = undefined;
+    try t.expectEqualStrings("CtrlP", hookName(decode("\x10"), &buf).?);
+    try t.expectEqualStrings("CtrlC", hookName(decode("\x03"), &buf).?);
+    try t.expect(hookName(decode("x"), &buf) == null);
     try t.expectEqual(Key{ .mouse = .{ .button = 0, .x = 97, .y = 0, .press = true } }, decode("\x1b[<0;98;1M"));
     try t.expectEqual(Key{ .mouse = .{ .button = 0, .x = 4, .y = 9, .press = false } }, decode("\x1b[<0;5;10m"));
     try t.expectEqual(Key.other, decode("\x1b[<0;98;1M\x1b[<0;98;1m"));
+}
+
+test "lastFocus finds focus reports glued to mouse motion" {
+    try testing.expectEqual(@as(?bool, true), lastFocus("\x1b[<35;10;5M\x1b[I\x1b[<35;11;5M"));
+    try testing.expectEqual(@as(?bool, false), lastFocus("\x1b[I\x1b[O"));
+    try testing.expectEqual(@as(?bool, null), lastFocus("\x1b[<35;10;5Mabc"));
 }
 
 test "ctrlCPlan: middle row of three" {
