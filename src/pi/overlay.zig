@@ -23,6 +23,10 @@ pub const Dialog = struct {
     /// `eachRow`: buttons per row (owned; the last count repeats). Empty:
     /// all on one row. All ones: a list (full-width rows).
     layout: []u8 = &.{},
+    /// Extra columns over which each button's background fades to black
+    /// (both sides together). The odd column goes on the right; 0 turns
+    /// the fade off.
+    fade_x: u16 = 2,
     /// Where each button was last drawn, for mouse clicks (render fills it).
     hits: std.ArrayListUnmanaged(Hit) = .{},
     /// A toast the user has moved through with ←/→: Enter / Esc now go to
@@ -339,8 +343,7 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *Dialog, cols:
             try sideOpen(a, out, y, x0);
             if (list) {
                 try addHit(a, d, y, cx, inner, sp.start);
-                try out.appendSlice(a, if (sp.start == d.active) btn_on else btn_off);
-                try padded(a, out, d.buttons[sp.start], inner, 1);
+                try paintButton(a, out, d.buttons[sp.start], inner, 1, sp.start == d.active, d.fade_x);
             } else if (grid) {
                 // Equal cells across the full width, labels centered.
                 const gaps = 2 * (sp.len - 1);
@@ -356,9 +359,7 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *Dialog, cols:
                     spare -|= 1;
                     const lead = (w -| @min(width(b), w)) / 2;
                     try addHit(a, d, y, cx + used, w, sp.start + j);
-                    try out.appendSlice(a, if (sp.start + j == d.active) btn_on else btn_off);
-                    try padded(a, out, b, w, lead);
-                    try out.appendSlice(a, reset);
+                    try paintButton(a, out, b, w, lead, sp.start + j == d.active, d.fade_x);
                     used += w;
                 }
                 try repeat(a, out, " ", inner -| used);
@@ -372,9 +373,7 @@ fn renderDialog(a: std.mem.Allocator, out: *std.ArrayList(u8), d: *Dialog, cols:
                     }
                     try addHit(a, d, y, at, width(b) + 2, sp.start + j);
                     at += width(b) + 2;
-                    try out.appendSlice(a, if (sp.start + j == d.active) btn_on else btn_off);
-                    try padded(a, out, b, width(b) + 2, 1);
-                    try out.appendSlice(a, reset);
+                    try paintButton(a, out, b, width(b) + 2, 1, sp.start + j == d.active, d.fade_x);
                 }
             }
             try sideClose(a, out);
@@ -408,6 +407,113 @@ fn sideClose(a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
 
 fn repeat(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8, n: usize) !void {
     for (0..n) |_| try out.appendSlice(a, s);
+}
+
+/// Foreground half of the two button looks (their background follows).
+const btn_on_fg = "\x1b[1;38;5;230;";
+const btn_off_fg = "\x1b[38;5;252;";
+/// xterm backgrounds 212 / 238, the colours those SGRs start from.
+const btn_on_rgb = [3]u8{ 0xff, 0x87, 0xd7 };
+const btn_off_rgb = [3]u8{ 0x44, 0x44, 0x44 };
+
+/// A button of exactly `w` columns: `lead` spaces, the label, padding.
+/// With `fade_x` > 0 the outermost columns' background ramps toward black,
+/// so the pill's edges melt into the dialog instead of ending on a hard
+/// line. `fade_x` is the width of both fades together.
+fn paintButton(
+    a: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    label: []const u8,
+    w: usize,
+    lead: usize,
+    active: bool,
+    fade_x: u16,
+) !void {
+    const base = if (active) btn_on else btn_off;
+    if (fade_x == 0) {
+        try out.appendSlice(a, base);
+        try padded(a, out, label, w, lead);
+        try out.appendSlice(a, reset);
+        return;
+    }
+    const fg = if (active) btn_on_fg else btn_off_fg;
+    const rgb = if (active) btn_on_rgb else btn_off_rgb;
+    // Lay the text out once, then paint every glyph with its own background.
+    var plain: std.ArrayList(u8) = .{};
+    defer plain.deinit(a);
+    try padded(a, &plain, label, w, lead);
+    const left: usize = fade_x / 2;
+    const right: usize = fade_x - left;
+    var it = (std.unicode.Utf8View.init(plain.items) catch {
+        try out.appendSlice(a, base);
+        try out.appendSlice(a, plain.items);
+        try out.appendSlice(a, reset);
+        return;
+    }).iterator();
+    var col: usize = 0;
+    while (it.nextCodepointSlice()) |cs| {
+        const cw = cpWidth(std.unicode.utf8Decode(cs) catch '?');
+        if (cw == 0) {
+            try out.appendSlice(a, cs);
+            continue;
+        }
+        const from_left: usize = if (col < left) left - col else 0;
+        const from_right: usize = if (col + cw > w -| right) col + cw - (w -| right) else 0;
+        const level = @max(from_left, from_right);
+        if (level == 0) {
+            try out.appendSlice(a, base);
+        } else {
+            const side = if (from_left >= from_right) left else right;
+            try out.print(a, "{s}48;5;{d}m", .{ fg, fadeIndex(rgb, level, side) });
+        }
+        try out.appendSlice(a, cs);
+        col += cw;
+    }
+    try out.appendSlice(a, reset);
+}
+
+/// `rgb` dimmed toward black by `level` of `side + 1` steps, as the nearest
+/// xterm-256 palette index.
+fn fadeIndex(rgb: [3]u8, level: usize, side: usize) u8 {
+    const den: u32 = @intCast(side + 1);
+    const f: u32 = @intCast(@min(level, side));
+    return nearest256(
+        @intCast(@as(u32, rgb[0]) * (den - f) / den),
+        @intCast(@as(u32, rgb[1]) * (den - f) / den),
+        @intCast(@as(u32, rgb[2]) * (den - f) / den),
+    );
+}
+
+/// RGB of an xterm-256 index (16..255: the 6x6x6 cube and the gray ramp).
+fn paletteRgb(i: u8) [3]u8 {
+    if (i >= 232) {
+        const v: u8 = @intCast(8 + (@as(u16, i) - 232) * 10);
+        return .{ v, v, v };
+    }
+    if (i >= 16) {
+        const steps = [_]u8{ 0, 0x5f, 0x87, 0xaf, 0xd7, 0xff };
+        const n = @as(u16, i) - 16;
+        return .{ steps[n / 36], steps[(n / 6) % 6], steps[n % 6] };
+    }
+    return .{ 0, 0, 0 };
+}
+
+fn nearest256(r: u8, g: u8, b: u8) u8 {
+    var best: u8 = 16;
+    var best_d: i32 = std.math.maxInt(i32);
+    var i: u16 = 16;
+    while (i < 256) : (i += 1) {
+        const p = paletteRgb(@intCast(i));
+        const dr = @as(i32, r) - @as(i32, p[0]);
+        const dg = @as(i32, g) - @as(i32, p[1]);
+        const db = @as(i32, b) - @as(i32, p[2]);
+        const d = dr * dr + dg * dg + db * db;
+        if (d < best_d) {
+            best_d = d;
+            best = @intCast(i);
+        }
+    }
+    return best;
 }
 
 /// `s` cut to `w` columns.
@@ -684,4 +790,69 @@ test "eachRow [2,2]: arrows move across rows" {
     dd.move(.down);
     dd.move(.down); // wraps to the first row
     try testing.expectEqual(@as(usize, 1), dd.active);
+}
+
+fn bgPalette(g: *Grid, x: usize, y: usize) ?u8 {
+    const c = g.term.screens.active.pages.getCell(.{ .active = .{ .x = @intCast(x), .y = @intCast(y) } }) orelse return null;
+    return switch (c.style().bg_color) {
+        .palette => |p| p,
+        else => null,
+    };
+}
+
+test "dialog buttons fade their outer columns toward black" {
+    var o: Overlay = .{ .allocator = testing.allocator };
+    defer o.deinit();
+    var d = testDialog(&.{"OK"});
+    d.fade_x = 2;
+    o.openDialog(d);
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(testing.allocator);
+    try o.render(&out, 60, 20);
+    const g = try Grid.create(testing.allocator, 60, 20);
+    defer g.destroy(testing.allocator);
+    g.feed(out.items);
+    var y: usize = 0;
+    while (y < 20) : (y += 1) {
+        const row = try rowString(g, y);
+        defer testing.allocator.free(row);
+        if (std.mem.indexOf(u8, row, "OK") == null) continue;
+        const x0 = buttonStart(g, y);
+        const x1 = buttonEnd(g, y);
+        try testing.expectEqual(@as(usize, 4), x1 - x0 + 1); // "OK" + 1 pad each side
+        // The middle is the full pink; both outer columns are the same dimmed pink.
+        try testing.expectEqual(@as(?u8, 212), bgPalette(g, x0 + 1, y));
+        const left = bgPalette(g, x0, y);
+        const right = bgPalette(g, x1, y);
+        try testing.expect(left != null and left.? != 212);
+        try testing.expectEqual(left, right);
+        return;
+    }
+    return error.NoButtons;
+}
+
+test "dialog buttons with fade_x = 0 keep a flat background" {
+    var o: Overlay = .{ .allocator = testing.allocator };
+    defer o.deinit();
+    var d = testDialog(&.{"OK"});
+    d.fade_x = 0;
+    o.openDialog(d);
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(testing.allocator);
+    try o.render(&out, 60, 20);
+    const g = try Grid.create(testing.allocator, 60, 20);
+    defer g.destroy(testing.allocator);
+    g.feed(out.items);
+    var y: usize = 0;
+    while (y < 20) : (y += 1) {
+        const row = try rowString(g, y);
+        defer testing.allocator.free(row);
+        if (std.mem.indexOf(u8, row, "OK") == null) continue;
+        const x0 = buttonStart(g, y);
+        const x1 = buttonEnd(g, y);
+        var x = x0;
+        while (x <= x1) : (x += 1) try testing.expectEqual(@as(?u8, 212), bgPalette(g, x, y));
+        return;
+    }
+    return error.NoButtons;
 }

@@ -79,10 +79,11 @@ runs the real `claude` binary.
 | `src/pi/overlay.zig` | Dialog / menu / row paints, appended after every CC chunk. |
 | `js/plugins/*.js` | Default plugins: `notify.js` (desktop notification), `herdry.js` (spinning tab title), `pace.js` (last ● duration + 3-minute cost, bottom-right snack). |
 | `js/rpc.js` | `pi` API + plugin registry (AsyncLocalStorage ownership, timer hooks, ◆ badge list). |
+| `js/stubs.js` | Plugin command stubs (`name:` alias + empty description) in the per-run `--plugin-dir`, so `pi.command` names appear in CC's `/` autocomplete (never the project's `.claude/`). |
 | `js/session.js` | Transcript cost / name, status-line parsing (effort, mode), Bash output rows. Prices from the claude-api skill. |
 | `js/plugins/panel.js` | Ctrl+P panel: rows of buttons (`eachRow [4,5,3,3,4]`), relabeled via the dialog handle once CC agrees. |
 | `js/tab.js` | Tab-title backends (Yakuake / Konsole / Guake over D-Bus) for `pi.tui.title`. |
-| `js/plugins/f12.js`, `js/cdp.js` | P5: `//` tab screenshot, `//gh/` URLs (tabs + History), `pi.ext.f12.addTrust` → `~/.F12-mcp.json`, MCP install hint. `cdp.js` = stdlib CDP client + Chrome discovery (`CLAUDE_P_CDP` or `DevToolsActivePort`). Tests inject `home` / `cdp`: never let them touch the real `~/.F12-mcp.json` or the user's Chrome. |
+| `js/plugins/f12.js`, `js/cdp.js` | P5: `//` tab screenshot + `.f12.md` (URL, console/exceptions/logs, MCP hint), `//gh/` URLs (tabs + History), `pi.ext.f12.addTrust` → `~/.F12-mcp.json`, `pi.ext.f12.devtools(url|id, {reload, ms})` live console, MCP install hint. `cdp.js` = stdlib CDP client + Chrome discovery (`CLAUDE_P_CDP` or `DevToolsActivePort`). Tests inject `home` / `cdp`: never let them touch the real `~/.F12-mcp.json` or the user's Chrome. |
 | `js/plugins/{add-dir,webpane,magpie}.js` | `/ad`, `/w` (+ `pi.ext.webpane`), `/m` (via `pi.sh`). Tests fake `pi`; don't run `/w` / `/m` for real in tests (npx server, desktop app). |
 | `goal-v1.ipynb` | `%%js` cell magic (stdlib CDP client, default :9229) + API examples. Agents test it against a sidecar on :9224. |
 | `src/pi/testdata/*.vt` | Raw CC output streams (100x30) replayed by screen/grid tests. |
@@ -130,6 +131,13 @@ runs the real `claude` binary.
   copied launch command instead of moving this session.
 - **Interactive mode (`src/pi/`) must not use `terminal.zig`.** The real
   terminal answers CC's DEC queries; fake replies would double up.
+- **CC's `/` autocomplete only reads `.claude/commands/`** (project and
+  user; we must not write either) or `--plugin-dir` plugins. Plugin
+  commands are namespaced (`cldp-pi:ad`), but a frontmatter `name: ad`
+  registers the bare name as an alias, which is what makes `/ad` complete.
+  `js/stubs.js` writes those stubs into the per-run plugin dir. CC scans
+  plugin commands only at launch and never hot-reloads them, so the sidecar
+  starts *before* claude and `main.zig` waits for its `ready` message.
 - **zmux never emits `session_exited` on pty EOF** — it only marks the
   session `.terminated`. `pi/main.zig` polls `state()` and calls
   `handle.reapExited()` to get the exit code.

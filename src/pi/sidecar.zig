@@ -102,9 +102,15 @@ fn exists(path: []const u8) bool {
     return true;
 }
 
-pub fn spawn(allocator: std.mem.Allocator, host_path: []const u8) !Sidecar {
-    const argv = [_][]const u8{ "node", host_path };
-    var child = std.process.Child.init(&argv, allocator);
+pub fn spawn(allocator: std.mem.Allocator, host_path: []const u8, plugin_dir: ?[]const u8) !Sidecar {
+    // host.js takes the `--plugin-dir` path (where pi.command stubs go) as
+    // its one argument.
+    var argv: [3][]const u8 = .{ "node", host_path, "" };
+    const argc: usize = if (plugin_dir) |d| blk: {
+        argv[2] = d;
+        break :blk 3;
+    } else 2;
+    var child = std.process.Child.init(argv[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     // stderr would scribble over CC's frames; host.js logs to a file instead.

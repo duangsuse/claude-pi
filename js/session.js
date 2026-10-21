@@ -144,7 +144,7 @@ function readFrom(path, offset) {
 // ---- reading CC's status line ----
 
 export const efforts = ['low', 'medium', 'high', 'xhigh', 'max']
-export const modes = ['plan', 'norm', 'auto']
+export const modes = ['plan', 'acc', 'auto']
 export const models = ['haiku', 'sonnet', 'opus', 'fable']
 
 /** "◐ medium · /effort" → "medium". */
@@ -152,11 +152,11 @@ export function effortOf(text) {
   return text.match(/\b(low|medium|high|xhigh|max)\s*·\s*\/effort/)?.[1] ?? null
 }
 
-/** Permission mode from the status line: plan / norm (manual) / auto / edits. */
+/** Permission mode from the status line: plan / norm (manual) / auto / acc (accept edits). */
 export function modeOf(text) {
   if (/plan mode on/.test(text)) return 'plan'
   if (/auto mode on/.test(text)) return 'auto'
-  if (/accept edits on/.test(text)) return 'edits'
+  if (/accept edits on/.test(text)) return 'acc'
   if (/manual mode on/.test(text)) return 'norm'
   return null
 }

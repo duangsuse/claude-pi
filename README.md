@@ -54,7 +54,7 @@ cost in the bottom-right corner. Both corners open the plugin list.
 
 | Key | In the input box |
 |---|---|
-| `./…` + Tab | fzf over files in CC's current dir → inserts `@path ` (ctrl-d: the file's folder) |
+| `./…` + Tab | fzf over files in CC's current dir → inserts `@path ` (cycles; ctrl-d: the file's folder) |
 | `/~/…` + Tab | same, under `~` |
 | `//…` + Tab | fzf over your Chrome tabs → screenshots the pick, inserts `@/tmp/….png ` |
 | `//gh/…` + Tab | URLs on that site (`gh` → github.com) from your tabs and Chrome history |
@@ -64,11 +64,14 @@ cost in the bottom-right corner. Both corners open the plugin list.
 | quitting with Ctrl+C | moves that conversation out of `~/.claude/projects/` to `~/claude/last` (replacing the previous one) and prints `To restore #> mv ~/claude/last …`; an empty session prints nothing (quit with `/exit` to keep it) |
 | mouse wheel | goes to Claude Code untouched; overlays step aside until it stops (`pi.arg.whlSpeed = n`: n notches = one PgUp / PgDn instead) |
 | double click | pages (PgUp / PgDn) the way the wheel last went |
-| Enter on a single line `/~/name` | creates `~/claude/name` and copies `cd … && npx cld-pi` to paste in a new terminal |
+| Enter on a single line `/~/name` | creates `~/claude/name`; in Yakuake / Guake it opens a new tab and runs `cd … && npx cld-pi` there, elsewhere it copies the command to paste in a new terminal |
 
 ## Commands
 
 Typed as a single line in the input box; Claude Code never sees them.
+Every registered name also gets a tiny stub in a throwaway
+`--plugin-dir` (inside claude-p's temp dir, never the project), so it shows
+up in Claude Code's `/` autocomplete as `cldp-pi:<name> (<name>)`.
 
 | Command | |
 |---|---|
@@ -89,6 +92,18 @@ offers its install command:
 claude mcp add chrome-devtools --scope user -- npx -y chrome-devtools-mcp@latest \
   --autoConnect --config ~/.F12-mcp.json --watchConfig
 ```
+
+Picking a tab types `@/tmp/…png` plus `@/tmp/…f12.md`: the tab's URL, what
+F12 shows (console messages, uncaught exceptions, network errors) and how to
+reach the same tab through the MCP. Plugins, and the F12 inspector, can also
+read a tab live:
+
+```js
+await pi.ext.f12.devtools('https://github.com/', { reload: false, ms: 500 })
+```
+
+`reload: true` reloads the page first, so the console replay starts from the
+fresh page. `target` is a URL, a URL prefix, or a CDP targetId.
 
 `CLAUDE_P_CDP=9222` (a port or a `ws://` URL) connects to another browser instead.
 
@@ -123,7 +138,7 @@ pi.arg.prompt = '>'   // also border, bash, busy, running: how the TUI's screen 
 pi.notify('3 tests left', 'snack')           // text in the top-right badge ('' takes it down)
 pi.notify('busy', 'snackRD', { bg: 236 })    // bottom-right; bg: 0-255, '#rrggbb', 'none'
 await pi.dialog({ title: 'Hi', body: 'gum-style', OK: () => {}, Stat: () => pi`/status` })
-pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // non-modal, top-right; ←/→ / click / Enter restart the timeout
+pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // non-modal, top-right, counts down "(3s)"; ←/→ / click stops the countdown
 pi.sed(ln => ln.includes('secret') ? '' : null)   // blank / rewrite screen rows
 await pi.on.stop      // wait for the next Stop hook
 ```

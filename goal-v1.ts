@@ -42,11 +42,13 @@ type Dialog = {
   footer?: string
   /** 非模态：显示在右上角，只借用 ←/→ 选按钮（其余键照常给 CC）；选过之后 Enter 按下、Esc 关闭，
    *  直到有键交给 CC；按钮也可以鼠标点击。timeout 毫秒后按下选中的按钮，每次交互重新计时
-   *  （初始选中 `or`；没有 or 且没动过则 resolve null） */
+   *  （初始选中 `or`；没有 or 且没动过则 resolve null）。正文末尾自动附上 "(3s)" 这样的延时 */
   timeout?: number
   or?: string
   /** 每行几个按钮：[2, 2] 即两行各两个（列对齐，最后一个数字重复使用）；'vertical' 一行一个（列表，如插件列表）。默认全在一行 */
   eachRow?: number[] | 'vertical'
+  /** 按钮背景在左右两边渐隐到黑色的总列数（默认 2，0 关闭），避免色块硬边 */
+  fadeX?: number
   /** 按钮获得焦点时在 footer 显示的说明，键是按钮的初始文字 */
   hints?: Record<string, string>
 } & {
@@ -66,7 +68,9 @@ interface Pi {
    */
   (strings: TemplateStringsArray, ...values: unknown[]): Promise<void>
 
-  /** 注册伪命令 /name：单行 `/name a b` 回车时拦截（CC 看不到），run(['a','b']) */
+  /** 注册伪命令 /name：单行 `/name a b` 回车时拦截（CC 看不到），run(['a','b'])。
+   *  同时会在本次运行的临时 --plugin-dir 里放一个 stub（不碰项目目录），
+   *  让名字以 `cldp-pi:<name> (<name>)` 出现在 CC 的 `/` 自动补齐里 */
   command(name: string, run: (args: string[]) => unknown): void
   /** 注册前缀补全：Tab 时以该前缀开头的词交给 source，候选由 Zig 侧交给 fzf，选中项原样替换该词。
    *  给了 pick 时选中项先交给它，替换成它返回的文字（null / '' 不输入），如标签页标题 → `@截图.png` */
@@ -119,7 +123,12 @@ interface Pi {
 
   /** 插件之间共享的扩展：核心只提供空对象，由同名插件发布（webpane.js → pi.ext.webpane，f12.js → pi.ext.f12） */
   ext: {
-    f12: { addTrust(allowedUrlPattern: string): Promise<void> }   // f12.js（P5）：追加到 ~/.F12-mcp.json（如 'https://github.com/*'）
+    f12: {
+      addTrust(allowedUrlPattern: string): Promise<void>   // f12.js（P5）：追加到 ~/.F12-mcp.json（如 'https://github.com/*'）
+      /** 标签页实时的控制台 / 未捕获异常 / 网络错误（URL、前缀或 targetId）；reload 先刷新，ms 是收集重放的时间 */
+      devtools(target: string, opts?: { reload?: boolean; ms?: number }):
+        Promise<Array<{ kind: 'console' | 'exception' | 'log'; level: string; text: string; at: string }> | null>
+    }
     /** webpane.js：先检查端口，没被占用就返回该端口，否则返回 null；两种情况都会显示 dialog */
     webpane: { boundPort(port: number): Promise<number | null> }
   }
@@ -159,5 +168,6 @@ export default (pi: Pi) => {
   s('send json')
 
   pi.ext.f12.addTrust('https://github.com/*')
+  pi.ext.f12.devtools('https://github.com/', { reload: true, ms: 500 })
   pi.ext.webpane.boundPort(8080)
 }

@@ -63,9 +63,15 @@ export function connect(url, ms = 30_000) {
     if (typeof WebSocket !== 'function') return reject(new Error('needs Node 22+ (global WebSocket)'))
     const ws = new WebSocket(url)
     const calls = new Map()
+    const listeners = new Set()
     let next = 1
     const cdp = {
       closed: false,
+      /** Events: fn(method, params, sessionId); returns the unsubscriber. */
+      on(fn) {
+        listeners.add(fn)
+        return () => listeners.delete(fn)
+      },
       send(method, params = {}, sessionId, ms = 10_000) {
         if (cdp.closed) return Promise.reject(new Error('CDP connection closed'))
         const id = next++
@@ -92,6 +98,10 @@ export function connect(url, ms = 30_000) {
     })
     ws.addEventListener('message', e => {
       const m = JSON.parse(e.data)
+      if (m.id == null && m.method) {
+        for (const fn of listeners) fn(m.method, m.params, m.sessionId)
+        return
+      }
       const c = calls.get(m.id)
       if (!c) return
       calls.delete(m.id)
@@ -134,6 +144,70 @@ export async function screenshot(cdp, targetId, ms = 4000) {
     await cdp.send('Target.activateTarget', { targetId })
     return await shot()
   } finally {
+    cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {})
+  }
+}
+
+/**
+ * Reload a tab and wait for its load event (`ms` at most). Detached again
+ * afterwards, so a following `devtools()` sees the fresh page's console from
+ * the start.
+ */
+export async function reload(cdp, targetId, ms = 5000) {
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true })
+  try {
+    await cdp.send('Page.enable', {}, sessionId)
+    const loaded = new Promise(done => {
+      const off = cdp.on((method, p, sid) => {
+        if (sid === sessionId && method === 'Page.loadEventFired') {
+          off()
+          done()
+        }
+      })
+      setTimeout(() => {
+        off()
+        done()
+      }, ms)
+    })
+    await cdp.send('Page.reload', {}, sessionId)
+    await loaded
+  } finally {
+    cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {})
+  }
+}
+
+/** A console argument as DevTools prints it, roughly. */
+const show = o => (o.value !== undefined ? (typeof o.value === 'string' ? o.value : JSON.stringify(o.value)) : o.description ?? o.unserializableValue ?? o.type)
+const where = f => (f?.url ? `${f.url}:${(f.lineNumber ?? 0) + 1}` : '')
+
+/**
+ * What F12 would show for a tab: console messages, uncaught exceptions and
+ * the browser's log (network errors, violations). V8 keeps the messages
+ * logged so far and replays them on Runtime.enable, as does Log.enable, so
+ * attaching late still sees them; `ms` is how long to collect the replay.
+ * Entries: { kind: 'console' | 'exception' | 'log', level, text, at }.
+ */
+export async function devtools(cdp, targetId, ms = 300) {
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true })
+  const out = []
+  const off = cdp.on((method, p, sid) => {
+    if (sid !== sessionId) return
+    if (method === 'Runtime.consoleAPICalled')
+      out.push({ kind: 'console', level: p.type, text: (p.args ?? []).map(show).join(' '), at: where(p.stackTrace?.callFrames?.[0]) })
+    else if (method === 'Runtime.exceptionThrown') {
+      const d = p.exceptionDetails ?? {}
+      out.push({ kind: 'exception', level: 'error', text: d.exception?.description ?? d.text ?? 'exception', at: where({ url: d.url, lineNumber: d.lineNumber }) })
+    } else if (method === 'Log.entryAdded') {
+      const e = p.entry ?? {}
+      out.push({ kind: 'log', level: e.level, text: `${e.source}: ${e.text}`, at: e.url ?? '' })
+    }
+  })
+  try {
+    await Promise.all([cdp.send('Runtime.enable', {}, sessionId), cdp.send('Log.enable', {}, sessionId)])
+    await new Promise(r => setTimeout(r, ms))
+    return out
+  } finally {
+    off()
     cdp.send('Target.detachFromTarget', { sessionId }).catch(() => {})
   }
 }

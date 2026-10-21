@@ -63,3 +63,32 @@ export async function pickTab(env = process.env) {
   }
   return null
 }
+
+/**
+ * Open a new tab in a dropdown terminal and run `command` there. Only
+ * Yakuake and Guake have a D-Bus call that does this (Konsole's terminals
+ * can't add a tab over D-Bus). Returns true once the command was handed
+ * over; false means the caller should fall back to "paste this".
+ */
+export async function openTab(command, env = process.env) {
+  if (env.GUAKE_TAB_UUID) {
+    const call = (m, ...a) => gdbus('org.guake3.RemoteControl', '/org/guake3/RemoteControl', `org.guake3.RemoteControl.${m}`, ...a)
+    // execute_command() opens and focuses the new tab itself (guake's
+    // dbusiface.py calls guake.add_tab()), so calling add_tab here too
+    // would leave an empty extra tab behind.
+    return (await call('execute_command', gstr(command))) != null
+  }
+  if (env.KONSOLE_DBUS_SERVICE && env.KONSOLE_DBUS_SESSION) {
+    const q = await qdbusBin()
+    if (!q) return false
+    // Konsole sets the same env vars; only act when the owner is Yakuake.
+    const owner = unwrap(await gdbus('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus.GetNameOwner', 'org.kde.yakuake'))
+    if (!owner || owner !== env.KONSOLE_DBUS_SERVICE) return false
+    // addSession() creates and focuses a tab and returns its session id;
+    // runCommandInTerminal() types the line into that session's shell.
+    const sid = await run(q, ['org.kde.yakuake', '/yakuake/sessions', 'org.kde.yakuake.addSession'])
+    if (sid == null || Number(sid) < 0) return false
+    return (await run(q, ['org.kde.yakuake', '/yakuake/sessions', 'org.kde.yakuake.runCommandInTerminal', String(sid), command])) != null
+  }
+  return false
+}

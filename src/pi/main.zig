@@ -396,8 +396,8 @@ const Keys = struct {
     /// A top-right (non-modal) dialog borrows ←/→ while it's up, to pick
     /// the button its timeout will press; after that Enter presses it and
     /// Esc dismisses it, until a key goes to the TUI. Its buttons can also
-    /// be clicked. Each of these tells the sidecar, which restarts the
-    /// timeout.
+    /// be clicked. Each of these tells the sidecar, which stops the
+    /// countdown (the toast then stays up until Enter or Esc).
     fn onToastKey(self: *Keys, key: input.Key, bytes: []const u8) bool {
         const sh = self.shared;
         sh.mutex.lock();
@@ -688,6 +688,15 @@ const Keys = struct {
         const cmd = input.launchCommand(a, target) catch return true;
         defer a.free(cmd);
         const copied = copyToClipboard(a, cmd);
+        // The sidecar knows whether this is a dropdown terminal (Yakuake /
+        // Guake) and can open a tab there; it also paints the dialog. No
+        // sidecar: a plain wrapper dialog with the paste instruction.
+        if (self.side) |s| {
+            if (s.alive) {
+                self.send(.{ .t = "launch", .title = target, .cmd = cmd, .copied = copied });
+                return true;
+            }
+        }
         self.showMessage(
             target,
             if (copied) "Launch command copied, paste it in a new terminal:" else "Run this in a new terminal (clipboard unavailable):",
@@ -844,9 +853,11 @@ fn readClipboard(allocator: std.mem.Allocator) ?[]u8 {
 ///   {"t":"write","data":s}   raw bytes to the pty
 ///   {"t":"arg","key":k,"value":v}  pi.arg.k = v (fzf, whlSpeed, border,
 ///        prompt, bash, busy, running)
-///   {"t":"dialog","id","title","body","footer","buttons":[..],"modal","eachRow"}
+///   {"t":"dialog","id","title","body","footer","buttons":[..],"modal","eachRow","fadeX"}
 ///        pi.dialog; modal:false (timeout set) is drawn top-right and leaves
-///        the keyboard to CC
+///        the keyboard to CC; fadeX: columns per button background fade
+///   {"t":"launch","title","cmd","copied"}  /~/name + Enter: open a tab in
+///        a dropdown terminal (or say how to paste), then repaint
 ///   {"t":"dialog_update","id","index"?,"label"?,"title"?,"body"?,"footer"?}
 ///        relabel a button (callback returned a string) and/or replace texts
 ///   {"t":"dialog_close","id"}
@@ -864,6 +875,49 @@ fn readClipboard(allocator: std.mem.Allocator) ?[]u8 {
 ///   {"t":"menu","id","items":[..]}  pi.menu
 ///   {"t":"paint","rows":[[row, text], ..]}  pi.sed results ("" blanks)
 ///   {"t":"subscribe","scr":bool}
+/// Sidecar lines that arrive before the pty / Keys exist (plugin loading
+/// happens before claude starts; its pi.command names must reach the
+/// plugin dir in time). `ready` says host.js finished loading plugins.
+const Prelude = struct {
+    allocator: std.mem.Allocator,
+    lines: std.ArrayList([]u8) = .{},
+    ready: bool = false,
+
+    fn onLine(self: *Prelude, line: []const u8) void {
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "{\"t\":\"ready\"}")) {
+            self.ready = true;
+            return;
+        }
+        const copy = self.allocator.dupe(u8, line) catch return;
+        self.lines.append(self.allocator, copy) catch self.allocator.free(copy);
+    }
+
+    fn clear(self: *Prelude) void {
+        for (self.lines.items) |l| self.allocator.free(l);
+        self.lines.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *Prelude) void {
+        self.clear();
+        self.lines.deinit(self.allocator);
+    }
+};
+
+/// Wait for host.js's `ready` (or the deadline / a dead sidecar), keeping
+/// every other line for replay.
+fn waitReady(s: *sidecar_mod.Sidecar, pre: *Prelude, timeout_ms: i32) bool {
+    const deadline = std.time.milliTimestamp() + timeout_ms;
+    while (!pre.ready and s.alive) {
+        const left = deadline - std.time.milliTimestamp();
+        if (left <= 0) break;
+        var fds = [_]posix.pollfd{.{ .fd = s.stdoutFd(), .events = posix.POLL.IN, .revents = 0 }};
+        _ = posix.poll(&fds, @intCast(left)) catch break;
+        if (fds[0].revents == 0) continue;
+        if (!s.pump(pre, Prelude.onLine)) break;
+    }
+    return pre.ready;
+}
+
 fn onSidecarLine(keys: *Keys, line: []const u8) void {
     const a = keys.allocator;
     const parsed = std.json.parseFromSlice(std.json.Value, a, line, .{}) catch return;
@@ -1097,6 +1151,7 @@ fn buildDialog(a: std.mem.Allocator, m: std.json.ObjectMap) !overlay_mod.Dialog 
         .footer = footer,
         .buttons = buttons,
         .layout = try layout.toOwnedSlice(a),
+        .fade_x = @intCast(@min(int(m, "fadeX") orelse 2, 64)),
     };
 }
 
@@ -1153,7 +1208,7 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
         break :blk false;
     };
 
-    var harness = try hook.createWith(allocator, .{ .events = &hook_events, .fullscreen = true });
+    var harness = try hook.createWith(allocator, .{ .events = &hook_events, .fullscreen = true, .plugin = true });
     defer harness.deinit();
 
     // Open the FIFO read end (plus a dummy writer so it never reports HUP
@@ -1165,11 +1220,26 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
     const fifo_keep = try posix.openZ(fifo_z, .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
     defer posix.close(fifo_keep);
 
+    // Start the sidecar first: its plugins register pi.command names, and
+    // the stubs must be in the plugin dir before claude scans --plugin-dir.
+    // Messages it emits in the meantime wait in `prelude` and are replayed
+    // once Keys is up.
+    var prelude: Prelude = .{ .allocator = allocator };
+    defer prelude.deinit();
+    var side: ?sidecar_mod.Sidecar = null;
+    if (sidecar_mod.findHost(allocator)) |host_path| {
+        defer allocator.free(host_path);
+        side = sidecar_mod.spawn(allocator, host_path, harness.plugin_dir) catch null;
+    }
+    defer if (side) |*s| s.deinit();
+    if (side) |*s| _ = waitReady(s, &prelude, 3000);
+
     const claude_bin = posix.getenv("CLAUDE_P_CLAUDE") orelse "claude";
     var argv: std.ArrayList([]const u8) = .{};
     defer argv.deinit(allocator);
     if (otherApp(extra)) |app| try argv.appendSlice(allocator, app) else {
         try argv.appendSlice(allocator, &.{ claude_bin, "--settings", harness.settings_json });
+        if (side != null) if (harness.plugin_dir) |pd| try argv.appendSlice(allocator, &.{ "--plugin-dir", pd });
         try argv.appendSlice(allocator, extra);
     }
     const quoted = try driver.shellQuoteArgv(allocator, argv.items);
@@ -1216,12 +1286,6 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
     };
     defer session.destroy();
 
-    var side: ?sidecar_mod.Sidecar = null;
-    if (sidecar_mod.findHost(allocator)) |host_path| {
-        defer allocator.free(host_path);
-        side = sidecar_mod.spawn(allocator, host_path) catch null;
-    }
-    defer if (side) |*s| s.deinit();
     // After both children are forked: a dead sidecar must not kill us.
     term.ignoreSigpipe();
     if (side) |*s| s.send(.{
@@ -1245,7 +1309,11 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
 
     var keys = try Keys.init(allocator, &shared, session);
     defer keys.deinit();
-    if (side) |*s| keys.side = s;
+    if (side) |*s| {
+        keys.side = s;
+        for (prelude.lines.items) |line| onSidecarLine(&keys, line);
+        prelude.clear();
+    }
 
     var fifo_buf: std.ArrayList(u8) = .{};
     defer fifo_buf.deinit(allocator);

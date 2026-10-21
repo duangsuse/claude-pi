@@ -9,9 +9,9 @@ const std = @import("std");
 /// tmux) and mouse noise. Grid.redraw restores all of it.
 pub const prelude = "\x1b[<99u\x1b[=0;1u\x1b[>4;0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
-/// Default for `pi.arg.fzf`. ctrl-d picks the folder the highlighted entry
-/// is in instead of the entry.
-pub const default_args = "--pointer '\u{25B6}' --bind 'ctrl-d:become(dirname -- {})'";
+/// Default for `pi.arg.fzf`. --cycle wraps ↑/↓ past the ends; ctrl-d picks
+/// the folder the highlighted entry is in instead of the entry.
+pub const default_args = "--cycle --pointer '\u{25B6}' --bind 'ctrl-d:become(dirname -- {})'";
 
 /// Let the user pick a path under `dir` (fzf's own walker unless the user
 /// set FZF_DEFAULT_COMMAND, so stdin must be the tty). `extra` is

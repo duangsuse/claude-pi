@@ -40,7 +40,7 @@ test('status line parsing (strings recorded from CC 2.1)', () => {
   assert.equal(effortOf('                                ◐ medium · /effort'), 'medium')
   assert.equal(modeOf('  ⏵⏵ auto mode on (shift+tab to cycle)'), 'auto')
   assert.equal(modeOf('  ⏸ manual mode on · ? for shortcuts'), 'norm')
-  assert.equal(modeOf('  ⏵⏵ accept edits on (shift+tab to cycle)'), 'edits')
+  assert.equal(modeOf('  ⏵⏵ accept edits on (shift+tab to cycle)'), 'acc')
   assert.equal(modeOf('  ⏸ plan mode on (shift+tab to cycle)'), 'plan')
   assert.equal(modelFamily('anthropic/claude-opus-5.5'), 'opus')
   assert.equal(modelFamily('Fable 5.1'), 'fable')

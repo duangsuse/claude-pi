@@ -122,7 +122,7 @@ export default pi => {
       hints: {
         ...radioHints('model', v => `/model ${v}`),
         ...radioHints('effort', v => `/effort ${v}`),
-        ...radioHints('mode', v => `${v === 'norm' ? 'manual' : v} mode (Shift+Tab until the status line agrees)`),
+        ...radioHints('mode', v => `${v === 'acc' ? 'accept edits' : v} mode (Shift+Tab until the status line agrees)`),
         [labels.file]: 'Allow Edit / Write without asking (.claude/settings.local.json)',
         [labels.web]: 'Allow WebFetch / WebSearch without asking (.claude/settings.local.json)',
         [labels.bash]: 'Show or hide Bash tool output on screen',

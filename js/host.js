@@ -9,7 +9,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createHost, lineSplitter } from './rpc.js'
-import { pickTab } from './tab.js'
+import { commandStubs } from './stubs.js'
+import { openTab, pickTab } from './tab.js'
 
 const dataDir = process.env.CLAUDE_P_DIR || join(homedir(), 'claude', '-p')
 mkdirSync(dataDir, { recursive: true })
@@ -45,8 +46,13 @@ const sh = line =>
     p.on('exit', code => setTimeout(() => resolve({ code: code ?? 1, stdout, stderr }), 50))
   })
 
+const stubs = commandStubs(process.argv[2] || process.env.CLAUDE_P_PLUGIN_DIR)
+process.on('exit', stubs.cleanup)
+// The binary closes our stdin on exit; signals take the shorter path (and
+// still run the 'exit' cleanup above).
+for (const sig of ['SIGTERM', 'SIGHUP', 'SIGINT']) process.on(sig, () => process.exit(0))
 const send = msg => process.stdout.write(JSON.stringify(msg) + '\n')
-const host = createHost(send, log, { notify, sh, tab: pickTab() })
+const host = createHost(send, log, { notify, sh, tab: pickTab(), openTab, stubs })
 const { pi, dispatch } = host
 // Timers plugins create are charged to them (cleared when turned off).
 host.installTimerHooks()
@@ -104,6 +110,9 @@ const loadDir = async (dir, prefix) => {
 }
 await loadDir(join(import.meta.dirname, 'plugins'), '')
 await loadDir(dataDir, '~/')
+// The binary waits for this before spawning claude: the command stubs must
+// be on disk by the time claude scans --plugin-dir.
+send({ t: 'ready' })
 
 process.stdin.setEncoding('utf8')
 process.stdin.on(

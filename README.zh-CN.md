@@ -48,7 +48,7 @@ rc 文件。
 
 | 按键 | 在输入框里 |
 |---|---|
-| `./…` + Tab | 用 fzf 选 CC 当前目录下的文件 → 插入 `@路径 `（ctrl-d：选该文件所在文件夹） |
+| `./…` + Tab | 用 fzf 选 CC 当前目录下的文件 → 插入 `@路径 `（可循环滚动；ctrl-d：选该文件所在文件夹） |
 | `/~/…` + Tab | 同上，范围是 `~` |
 | `//…` + Tab | 用 fzf 选 Chrome 标签页 → 截图，插入 `@/tmp/….png ` |
 | `//gh/…` + Tab | 补全该站点（`gh` → github.com）的 URL，来源是标签页和 Chrome 历史 |
@@ -58,11 +58,11 @@ rc 文件。
 | 双击 | 顺着上次滚轮的方向翻一页（PgUp / PgDn） |
 | Ctrl+Enter | 粘贴剪贴板并提交（终端需支持 kitty 键盘协议或 modifyOtherKeys） |
 | Ctrl+P | 设置面板：会话名和花费、model / effort / mode、file / web 权限、隐藏 Bash 输出、CtrlO / CtrlR / Undo / Copy |
-| 单行输入 `/~/名字` 后回车 | 创建 `~/claude/名字`，并把 `cd … && npx cld-pi` 复制到剪贴板，在新终端粘贴即可打开 |
+| 单行输入 `/~/名字` 后回车 | 创建 `~/claude/名字`；Yakuake / Guake 里直接开新 tab 运行 `cd … && npx cld-pi`，其他终端把命令复制到剪贴板，在新终端粘贴即可打开 |
 
 ## 命令
 
-在输入框里单独一行输入；Claude Code 看不到这些行。
+在输入框里单独一行输入；Claude Code 看不到这些行。每个注册的名字还会在 claude-p 每次运行的临时 `--plugin-dir` 里放一个很小的 stub（不会碰项目目录），让它在 Claude Code 的 `/` 自动补齐里以 `cldp-pi:<名字> (<名字>)` 出现。
 
 | 命令 | |
 |---|---|
@@ -81,6 +81,16 @@ Claude 通过它操作同一个浏览器。第一次用 `//` 时会提示安装�
 claude mcp add chrome-devtools --scope user -- npx -y chrome-devtools-mcp@latest \
   --autoConnect --config ~/.F12-mcp.json --watchConfig
 ```
+
+选中标签页会输入 `@/tmp/…png` 和 `@/tmp/…f12.md`：后者是标签页 URL、F12 能看到的东西
+（控制台消息、未捕获异常、网络错误）以及如何通过 MCP 找到同一个标签页。插件和 F12 inspector
+也可以实时读取：
+
+```js
+await pi.ext.f12.devtools('https://github.com/', { reload: false, ms: 500 })
+```
+
+`reload: true` 会先刷新页面，让控制台重放从新页面开始。`target` 可以是 URL、URL 前缀或 CDP targetId。
 
 `CLAUDE_P_CDP=9222`（端口或 `ws://` URL）改连别的浏览器。
 
@@ -116,7 +126,7 @@ pi.arg.prompt = '>'   // 还有 border、bash、busy、running：怎样识别 TU
 pi.notify('3 tests left', 'snack')           // 显示在右上角角标（'' 撤下）
 pi.notify('busy', 'snackRD', { bg: 236 })    // 右下角；bg：0-255、'#rrggbb'、'none'（透明）
 await pi.dialog({ title: 'Hi', body: 'gum-style', OK: () => {}, Stat: () => pi`/status` })
-pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // 非模态，显示在右上角；←/→、点击、Enter 都会重新计时
+pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK: () => {} })   // 非模态，右上角，正文实时倒计时 "(3s)"；←/→、点击会停止计时
 pi.sed(ln => ln.includes('secret') ? '' : null)   // blank / rewrite screen rows
 await pi.on.stop      // wait for the next Stop hook
 ```

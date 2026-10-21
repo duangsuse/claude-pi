@@ -19,9 +19,18 @@ pub const HookHarness = struct {
     script_path: []u8,
     /// Inline JSON suitable for `--settings <this>`.
     settings_json: []u8,
+    /// `<tmp_dir>/plugin` when the caller asked for one: a Claude Code
+    /// plugin (`--plugin-dir`) holding the pi.command stubs, so the names
+    /// show up in CC's `/` autocomplete without touching the project's
+    /// `.claude/`.
+    plugin_dir: ?[]u8 = null,
 
     pub fn deinit(self: *HookHarness) void {
         // Best-effort cleanup.
+        if (self.plugin_dir) |d| {
+            std.fs.cwd().deleteTree(d) catch {};
+            self.allocator.free(d);
+        }
         std.fs.cwd().deleteFile(self.fifo_path) catch {};
         std.fs.cwd().deleteFile(self.script_path) catch {};
         std.fs.cwd().deleteDir(self.tmp_dir) catch {};
@@ -56,6 +65,9 @@ pub const SettingsSpec = struct {
     events: []const []const u8 = &.{ "SessionStart", "Stop" },
     /// Interactive mode (src/pi/) only supports `/tui fullscreen`.
     fullscreen: bool = false,
+    /// Create an empty plugin dir for `claude --plugin-dir` (see
+    /// HookHarness.plugin_dir).
+    plugin: bool = false,
 };
 
 /// Build a harness for `claude -p` emulation (SessionStart + Stop).
@@ -100,12 +112,31 @@ pub fn createWith(allocator: std.mem.Allocator, spec: SettingsSpec) !HookHarness
     const settings_json = try buildSettingsJson(allocator, script_path, spec);
     errdefer allocator.free(settings_json);
 
+    var plugin_dir: ?[]u8 = null;
+    if (spec.plugin) {
+        const dir = try std.fs.path.join(allocator, &.{ tmp_dir, "plugin" });
+        errdefer allocator.free(dir);
+        const manifest_dir = try std.fs.path.join(allocator, &.{ dir, ".claude-plugin" });
+        defer allocator.free(manifest_dir);
+        try std.fs.cwd().makePath(manifest_dir);
+        const commands_dir = try std.fs.path.join(allocator, &.{ dir, "commands" });
+        defer allocator.free(commands_dir);
+        try std.fs.cwd().makePath(commands_dir);
+        const manifest = try std.fs.path.join(allocator, &.{ manifest_dir, "plugin.json" });
+        defer allocator.free(manifest);
+        var f = try std.fs.cwd().createFile(manifest, .{});
+        defer f.close();
+        try f.writeAll("{\"name\":\"cldp-pi\",\"version\":\"0.0.0\"}\n");
+        plugin_dir = dir;
+    }
+
     return HookHarness{
         .allocator = allocator,
         .tmp_dir = tmp_dir,
         .fifo_path = fifo_path,
         .script_path = script_path,
         .settings_json = settings_json,
+        .plugin_dir = plugin_dir,
     };
 }
 

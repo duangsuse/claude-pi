@@ -225,6 +225,65 @@ test('non-modal dialog: timeout presses the `or` button', async () => {
   assert.equal(await r2, null)
 })
 
+test('non-modal dialog: body ends with its timeout; text updates keep it', async () => {
+  const sent = []
+  const { pi } = createHost(m => sent.push(m))
+  pi.dialog({ body: 'saved', timeout: 3000, or: 'OK', OK() {} })
+  assert.equal(sent[0].body, 'saved (3s)')
+  const d = sent[0]
+  // Handle text(): the timer note is presentation, not part of the body.
+  assert.equal(typeof (pi.dialog({ body: 'x', timeout: 1500, OK() {} }).text), 'function')
+  assert.equal(sent.at(-1).body, 'x (2s)')
+  // An empty body still says how long the toast lives.
+  pi.dialog({ timeout: 2000, OK() {} })
+  assert.equal(sent.at(-1).body, '(2s)')
+  void d
+})
+
+test('dialog fadeX passes through; absent means the Zig default', () => {
+  const sent = []
+  const { pi } = createHost(m => sent.push(m))
+  pi.dialog({ body: 'a', fadeX: 6, OK() {} })
+  assert.equal(sent[0].fadeX, 6)
+  pi.dialog({ body: 'b', OK() {} })
+  assert.equal('fadeX' in sent.at(-1), false)
+})
+
+test('launch: a dropdown terminal gets a tab; otherwise the paste dialog', async () => {
+  const sent = []
+  const opened = []
+  let ok = true
+  const { dispatch } = createHost(m => sent.push(m), () => {}, {
+    openTab: async cmd => (opened.push(cmd), ok),
+  })
+  dispatch({ t: 'launch', title: '/home/u/claude/x', cmd: "cd '/home/u/claude/x' && npx cld-pi", copied: true })
+  await tick(5)
+  assert.deepEqual(opened, ["cd '/home/u/claude/x' && npx cld-pi"])
+  let d = sent.findLast(m => m.t === 'dialog')
+  assert.equal(d.modal, false)
+  assert.equal(d.body, 'Opened a new tab in this terminal. (3s)')
+
+  ok = false
+  dispatch({ t: 'launch', title: '/home/u/claude/y', cmd: 'cd y && npx cld-pi', copied: false })
+  await tick(5)
+  d = sent.findLast(m => m.t === 'dialog')
+  assert.equal(d.modal, true)
+  assert.equal(d.body, 'Run this in a new terminal (clipboard unavailable):\ncd y && npx cld-pi')
+})
+
+test('pi.command names are mirrored to the command-stub writer', async () => {
+  const calls = []
+  const host = createHost(() => {}, () => {}, { stubs: names => calls.push([...names]) })
+  await host.loadPlugin('cmds.js', pi => {
+    pi.command('ad', () => {})
+    pi.command('w', () => {})
+    pi.command('bad name', () => {})
+  })
+  assert.deepEqual(calls.at(-1), ['ad', 'w', 'bad name'])
+  await host.setEnabled('cmds.js', false)
+  assert.deepEqual(calls.at(-1), [])
+})
+
 test('badge click lists plugins one per row; a button toggles', async () => {
   const sent = []
   const host = createHost(m => sent.push(m))
@@ -336,13 +395,14 @@ test('tui.title without a tab backend uses the window title (OSC via Zig)', asyn
   assert.deepEqual(sent, [{ t: 'title', text: 'x' }, { t: 'title', text: null }])
 })
 
-test('toast: starts on `or`, ←/→ picks, timeout presses the pick; hints follow focus', async () => {
+test('toast: starts on `or`, ←/→ picks and stops the clock; Enter presses; hints follow focus', async () => {
   const sent = []
   const { pi, dispatch } = createHost(m => sent.push(m))
   const pressed = []
   const r = pi.dialog({ body: 'keep?', timeout: 30, or: 'Keep', Keep: () => pressed.push('Keep'), Drop: () => pressed.push('Drop') })
   assert.equal(sent[0].active, 0)
   dispatch({ t: 'dialog_active', id: 1, index: 1 })
+  dispatch({ t: 'dialog_button', id: 1, index: 1 })
   assert.equal(await r, 'Drop')
   assert.deepEqual(pressed, ['Drop'])
 
@@ -377,15 +437,41 @@ test('pi.notify snack / snackRD take the badge corners; off with the plugin', as
   assert.deepEqual(badges().findLast(m => m.pos), { t: 'badge', pos: 'rd', text: null })
 })
 
-test('toast: ←/→ restarts the timeout', async () => {
-  const host = createHost(() => {})
+test('toast: ←/→ stops the countdown and drops the note; Enter presses', async () => {
+  const sent = []
+  const host = createHost(m => sent.push(m))
   let pressed = null
-  const r = host.pi.dialog({ body: 'b', timeout: 40, or: 'A', A: () => (pressed = 'A'), B: () => (pressed = 'B') })
+  const r = host.pi.dialog({
+    body: 'b',
+    timeout: 400,
+    or: 'A',
+    A: () => {
+      pressed = 'A'
+    },
+    B: () => {
+      pressed = 'B'
+    },
+  })
+  assert.equal(sent[0].body, 'b (0s)')
   await tick(25)
   host.dispatch({ t: 'dialog_active', id: 1, index: 1 })
-  await tick(25)
-  assert.equal(pressed, null) // 50 ms in, but re-armed at 25
+  assert.deepEqual(sent.at(-1), { t: 'dialog_update', id: 1, body: 'b' })
+  await tick(400)
+  assert.equal(pressed, null) // no longer fires by itself
+  host.dispatch({ t: 'dialog_button', id: 1, index: 1 })
   assert.equal(await r, 'B')
+})
+
+test('toast: the countdown updates while it waits', async () => {
+  const sent = []
+  const host = createHost(m => sent.push(m))
+  const r = host.pi.dialog({ body: 'b', timeout: 5000, or: 'OK', OK() {} })
+  assert.equal(sent[0].body, 'b (5s)')
+  await tick(600)
+  const upd = sent.findLast(m => m.t === 'dialog_update')
+  assert.match(upd.body, /^b \(4s\)$/)
+  host.dispatch({ t: 'dialog_closed', id: 1 })
+  assert.equal(await r, null)
 })
 
 test('snack bg: 256-colour, #hex, none; bad values fall back to the default', async () => {

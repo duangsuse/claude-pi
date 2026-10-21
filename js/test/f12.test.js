@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { activePortUrl, chromeDirs, findBrowser, history } from '../cdp.js'
-import { addTrust, f12, mcpInstalled, parseToken, siteMatch, tabItems, trustPattern, urlItems } from '../plugins/f12.js'
+import { addTrust, f12, f12Report, mcpInstalled, parseToken, siteMatch, tabByKey, tabItems, trustPattern, urlItems } from '../plugins/f12.js'
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'cld-pi-f12-'))
 const tick = () => new Promise(r => setTimeout(r, 5))
@@ -40,6 +40,18 @@ test('tabItems: one line per tab, duplicates numbered', () => {
     items.map(i => i.label),
     ['Issues · x — github.com', 'Issues · x — github.com (2)', 'about:blank — about:blank'],
   )
+})
+
+test('tabByKey: targetId first, then the URL, then its prefix', () => {
+  const tabs = [
+    { targetId: 'T1', url: 'https://github.com/a/b' },
+    { targetId: 'T2', url: 'https://github.com/abc' },
+  ]
+  assert.equal(tabByKey(tabs, 'T2'), tabs[1])
+  assert.equal(tabByKey(tabs, 'https://github.com/abc'), tabs[1])
+  assert.equal(tabByKey(tabs, 'https://github.com/a'), tabs[0])
+  assert.equal(tabByKey(tabs, ''), null)
+  assert.equal(tabByKey(tabs, 'https://gitlab.com/'), null)
 })
 
 test('trustPattern: the origin, any path; nothing for non-web URLs', () => {
@@ -108,6 +120,7 @@ const fakeCdp = (browser, tabList = [], visited = []) => ({
   tabs: async () => tabList,
   history: async dir => (dir ? visited : []),
   screenshot: async (_, targetId) => Buffer.from(`png of ${targetId}`),
+  devtools: async () => [{ kind: 'console', level: 'error', text: 'boom\nline 2', at: 'https://github.com/app.js:3' }],
 })
 
 test('// without a debuggable Chrome: no candidates, a dialog explains chrome://inspect', async () => {
@@ -128,8 +141,14 @@ test('// picks a tab: screenshot → @png, site trusted, MCP offered once', asyn
   const items = await pi.source('//')
   assert.deepEqual(items, ['Repo — github.com'])
   const text = await pi.pick(items[0], '//')
-  assert.match(text, /^@.*cld-pi-github\.com-\d+\.png$/)
-  assert.equal(readFileSync(text.slice(1), 'utf8'), 'png of T1')
+  const [png, md] = text.split(' ')
+  assert.match(png, /^@.*cld-pi-github\.com-\d+\.png$/)
+  assert.equal(md, `${png.slice(0, -'.png'.length)}.f12.md`)
+  assert.equal(readFileSync(png.slice(1), 'utf8'), 'png of T1')
+  const report = readFileSync(md.slice(1), 'utf8')
+  assert.match(report, /URL: https:\/\/github\.com\/a\/b/)
+  assert.match(report, /- \[error\] boom ⏎ line 2  \(https:\/\/github\.com\/app\.js:3\)/)
+  assert.match(report, /MCP is not installed/)
   await tick()
   const cfg = JSON.parse(readFileSync(join(home, '.F12-mcp.json'), 'utf8'))
   assert.deepEqual(cfg.allowedUrlPattern, ['https://github.com/*'])
@@ -160,4 +179,43 @@ test('pi.ext.f12.addTrust and an existing MCP: config created at start, no offer
   assert.equal(readFileSync(join(home, '.F12-mcp.json'), 'utf8'), '{}\n')
   await pi.ext.f12.addTrust('https://a.com/*')
   assert.deepEqual(JSON.parse(readFileSync(join(home, '.F12-mcp.json'), 'utf8')).allowedUrlPattern, ['https://a.com/*'])
+})
+
+test('pi.ext.f12.devtools: tab by URL or id, optional reload, the live entries', async () => {
+  const home = tmp()
+  const { pi, dialogs } = fakePi(home)
+  const tabs = [{ targetId: 'T1', title: 'Repo', url: 'https://github.com/a/b', type: 'page' }]
+  const cdp = fakeCdp({ url: 'ws://x', dir: null }, tabs)
+  const seen = []
+  cdp.reloads = []
+  cdp.reload = async (_, id) => void cdp.reloads.push(id)
+  cdp.devtools = async (_, id) => (seen.push(id), [{ kind: 'console', level: 'log', text: id, at: '' }])
+  f12({ home, cdp })(pi)
+
+  assert.deepEqual(await pi.ext.f12.devtools('https://github.com/a', { reload: true }), [{ kind: 'console', level: 'log', text: 'T1', at: '' }])
+  assert.deepEqual(cdp.reloads, ['T1'])
+  await pi.ext.f12.devtools('T1')
+  assert.deepEqual(cdp.reloads, ['T1']) // no reload unless asked
+  assert.deepEqual(seen, ['T1', 'T1'])
+
+  assert.equal(await pi.ext.f12.devtools('https://gitlab.com/'), null)
+  assert.equal(dialogs.at(-1).body, 'No Chrome tab for https://gitlab.com/')
+})
+
+test('pi.ext.f12.devtools: no debuggable Chrome explains chrome://inspect', async () => {
+  const home = tmp()
+  const { pi, dialogs } = fakePi(home)
+  f12({ home, cdp: fakeCdp(null) })(pi)
+  assert.equal(await pi.ext.f12.devtools('any'), null)
+  assert.match(dialogs[0].body, /chrome:\/\/inspect/)
+})
+
+test('f12Report: MCP pointer, unreadable console, the last `max` entries', () => {
+  const base = { title: 'T', url: 'https://a.com/', png: '/tmp/a.png' }
+  assert.match(f12Report({ ...base, entries: [], mcp: true }), /list_pages, then select_page[\s\S]*\(empty\)/)
+  assert.match(f12Report({ ...base, entries: null, mcp: true }), /could not read the console/)
+  const many = Array.from({ length: 5 }, (_, i) => ({ kind: 'log', level: 'warning', text: `w${i}`, at: '' }))
+  const r = f12Report({ ...base, entries: many, mcp: false, max: 2 })
+  assert.match(r, /\(5, last 2\)/)
+  assert.ok(!r.includes('w2') && r.includes('- [log warning] w4'))
 })

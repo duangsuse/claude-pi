@@ -24,6 +24,9 @@ export function lineSplitter(onLine) {
 
 const dialogText = new Set(['title', 'body', 'footer'])
 
+/** "2s" / "1.5s" for a non-modal dialog's timeout. */
+export const timeoutLabel = ms => `${Math.round(Number(ms) / 1000)}s`
+
 /** SGR parameters for a snack background (see pi.notify); undefined: default. */
 export function snackSgr(bg) {
   if (bg == null) return undefined
@@ -41,8 +44,10 @@ export const shQuote = v => `'${String(v).replace(/'/g, `'\\''`)}'`
 /**
  * @param {(msg: object) => void} send  writes one message to the Zig side
  * @param {(...a: unknown[]) => void} log
- * @param {{ notify?: (msg: string) => void, sh?: (line: string) => Promise<{code: number, stdout: string, stderr: string}>, tab?: Promise<{ get(): Promise<string|null>, set(t: string): Promise<unknown> } | null> }} [io]
- *   side effects the host provides; `tab` is the tab-title backend (js/tab.js)
+ * @param {{ notify?: (msg: string) => void, sh?: (line: string) => Promise<{code: number, stdout: string, stderr: string}>, tab?: Promise<{ get(): Promise<string|null>, set(t: string): Promise<unknown> } | null>, openTab?: (cmd: string) => Promise<boolean>, stubs?: (names: string[]) => void }} [io]
+ *   side effects the host provides; `tab` is the tab-title backend
+ *   (js/tab.js), `openTab` opens a terminal tab (Yakuake / Guake), `stubs`
+ *   mirrors pi.command names into CC's command autocomplete
  */
 export function createHost(send, log = () => {}, io = {}) {
   // focused: from the terminal's focus reports (CSI I / O). Starts true:
@@ -161,7 +166,11 @@ export function createHost(send, log = () => {}, io = {}) {
   // pi.command('ad', args => …): `/ad x y` + Enter runs it with ['x', 'y'];
   // CC never sees the line.
   const commands = new Map() // name -> { run, p }
-  const syncCommands = () => send({ t: 'commands', names: [...commands.keys()] })
+  const syncCommands = () => {
+    const names = [...commands.keys()]
+    send({ t: 'commands', names })
+    io.stubs?.(names)
+  }
   pi.command = (name, run) => {
     const entry = { run, p: owner() }
     commands.set(name, entry)
@@ -272,6 +281,7 @@ export function createHost(send, log = () => {}, io = {}) {
     if (!dlg) return
     dialogs.delete(id)
     orig.clearTimeout(dlg.timer)
+    orig.clearInterval(dlg.ticker)
     send({ t: 'dialog_close', id })
     dlg.resolve(label)
   }
@@ -283,11 +293,22 @@ export function createHost(send, log = () => {}, io = {}) {
     const hints = labels.map(l => d.hints?.[l])
     const active = Math.max(0, labels.indexOf(d.or))
     const footer = d.footer ?? ''
-    const msg = { t: 'dialog', id, title: d.title ?? '', body: d.body ?? '', footer: hints[active] ?? footer, buttons: labels, modal, active }
+    // A non-modal dialog says how long it stays: body + " (2s)", kept live.
+    // Touching it stops the countdown and drops the note (it stays up until
+    // a button or Esc closes it).
+    const base = d.body == null ? '' : String(d.body)
+    const withLeft = (text, ms) => (ms == null ? text : text ? `${text} (${timeoutLabel(ms)})` : `(${timeoutLabel(ms)})`)
+    const stamp = modal ? '' : withLeft('', d.timeout)
+    const body = base + (stamp ? (base ? ` ${stamp}` : stamp) : '')
+    const msg = { t: 'dialog', id, title: d.title ?? '', body, footer: hints[active] ?? footer, buttons: labels, modal, active }
     if (d.eachRow != null) msg.eachRow = d.eachRow
+    if (d.fadeX != null) msg.fadeX = d.fadeX
     send(msg)
     const done = new Promise(resolve =>
-      dialogs.set(id, { fns: buttons.map(([, v]) => v), labels, resolve, p: owner(), hints, footer, active, moved: false }),
+      dialogs.set(id, {
+        fns: buttons.map(([, v]) => v), labels, resolve, p: owner(), hints, footer, active, moved: false,
+        base, remaining: modal ? null : d.timeout,
+      }),
     )
     // The handle: relabel(from, to) any button, text({ title, body, footer }).
     done.relabel = (from, to) => {
@@ -298,18 +319,16 @@ export function createHost(send, log = () => {}, io = {}) {
       send({ t: 'dialog_update', id, index, label: String(to) })
     }
     done.text = texts => {
-      if (!dialogs.has(id)) return
-      if (texts.footer != null) dialogs.get(id).footer = String(texts.footer)
-      send({ t: 'dialog_update', id, ...texts })
+      const dlg = dialogs.get(id)
+      if (!dlg) return
+      if (texts.footer != null) dlg.footer = String(texts.footer)
+      const out = { ...texts }
+      if (texts.body != null) dlg.base = String(texts.body)
+      if (!modal) out.body = withLeft(dlg.base, dlg.remaining)
+      send({ t: 'dialog_update', id, ...out })
     }
     if (!modal) {
-      // Any interaction (←/→, a click or Enter that keeps it open) starts
-      // the timeout over.
       const dlg = dialogs.get(id)
-      dlg.rearm = () => {
-        orig.clearTimeout(dlg.timer)
-        dlg.timer = orig.setTimeout(fire, d.timeout)
-      }
       const fire = async () => {
         if (dialogs.get(id) !== dlg) return
         const i = dlg.moved || dlg.labels.includes(d.or) ? dlg.active : -1
@@ -322,14 +341,42 @@ export function createHost(send, log = () => {}, io = {}) {
         }
         closeDialog(id, i >= 0 ? dlg.labels[i] : null)
       }
-      dlg.rearm()
+      // Any interaction (←/→, a click, Enter) stops the countdown.
+      dlg.stop = () => {
+        if (dlg.stopped) return
+        dlg.stopped = true
+        dlg.remaining = null
+        orig.clearInterval(dlg.ticker)
+        dlg.ticker = null
+        send({ t: 'dialog_update', id, body: withLeft(dlg.base, null) })
+      }
+      dlg.endAt = Date.now() + d.timeout
+      let shown = timeoutLabel(d.timeout)
+      // Tenths are what the label shows, so 10 updates a second.
+      dlg.ticker = orig.setInterval(() => {
+        if (dialogs.get(id) !== dlg || dlg.stopped) return
+        dlg.remaining = Math.max(0, dlg.endAt - Date.now())
+        if (dlg.remaining <= 0) {
+          orig.clearInterval(dlg.ticker)
+          dlg.ticker = null
+          fire()
+          return
+        }
+        const label = timeoutLabel(dlg.remaining)
+        if (label !== shown) {
+          shown = label
+          send({ t: 'dialog_update', id, body: withLeft(dlg.base, dlg.remaining) })
+        }
+      }, 100)
+      // A toast must not keep the process alive on its own.
+      dlg.ticker.unref?.()
     }
     return done
   }
   const pressButton = async ({ id, index }) => {
     const dlg = dialogs.get(id)
     if (!dlg) return
-    dlg.rearm?.()
+    dlg.stop?.()
     let r
     try {
       r = await inOwner(dlg.p, () => dlg.fns[index]?.())
@@ -339,7 +386,6 @@ export function createHost(send, log = () => {}, io = {}) {
     if (typeof r === 'string') {
       dlg.labels[index] = r
       send({ t: 'dialog_update', id, index, label: r })
-      dlg.rearm?.()
       return
     }
     closeDialog(id, dlg.labels[index])
@@ -578,6 +624,39 @@ export function createHost(send, log = () => {}, io = {}) {
       case 'key':
         send({ t: 'key_result', id: msg.id, prevent: emit(msg.name) === false })
         break
+      case 'launch': {
+        // /~/name + Enter. The Zig side already copied the launch command;
+        // a dropdown terminal gets a new tab, everything else a paste dialog.
+        const cmd = String(msg.cmd ?? '')
+        const title = String(msg.title ?? '')
+        const fallback = () =>
+          pi
+            .dialog({
+              title,
+              body: `${msg.copied === false ? 'Run this in a new terminal (clipboard unavailable):' : 'Launch command copied, paste it in a new terminal:'}\n${cmd}`,
+              footer: 'enter / esc to close',
+              OK() {},
+            })
+            .catch(() => {})
+        Promise.resolve()
+          .then(() => io.openTab?.(cmd))
+          .catch(e => (log('openTab threw', e), false))
+          .then(ok =>
+            ok
+              ? pi
+                  .dialog({
+                    title,
+                    body: 'Opened a new tab in this terminal.',
+                    footer: 'enter / esc to close',
+                    timeout: 2500,
+                    or: 'OK',
+                    OK() {},
+                  })
+                  .catch(() => {})
+              : fallback(),
+          )
+        break
+      }
       case 'command': {
         const c = commands.get(msg.name)
         const args = String(msg.args ?? '').split(/\s+/).filter(Boolean)
@@ -622,14 +701,17 @@ export function createHost(send, log = () => {}, io = {}) {
         if (!dlg) break
         dlg.active = msg.index
         dlg.moved = true
-        dlg.rearm?.()
+        dlg.stop?.()
         if (dlg.hints.some(h => h != null)) send({ t: 'dialog_update', id: msg.id, footer: dlg.hints[msg.index] ?? dlg.footer })
         break
       }
       case 'dialog_closed': {
         const dlg = dialogs.get(msg.id)
         dialogs.delete(msg.id)
-        if (dlg) orig.clearTimeout(dlg.timer)
+        if (dlg) {
+          orig.clearTimeout(dlg.timer)
+          orig.clearInterval(dlg.ticker)
+        }
         dlg?.resolve(null)
         break
       }

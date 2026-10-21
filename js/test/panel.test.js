@@ -63,7 +63,7 @@ test('Ctrl+P opens the panel; effort and file buttons change state and read it b
     assert.equal(d.title, 'this session  ·  $0.00')
     assert.deepEqual(d.eachRow, [4, 5, 3, 3, 4])
     assert.deepEqual(d.buttons.slice(4, 9), ['○ low', '● medium', '○ high', '○ xhigh', '○ max'])
-    assert.deepEqual(d.buttons.slice(9, 12), ['○ plan', '○ norm', '● auto'])
+    assert.deepEqual(d.buttons.slice(9, 12), ['○ plan', '○ acc', '● auto'])
     assert.deepEqual(d.buttons.slice(15), ['CtrlO', 'CtrlR', 'Undo', 'Copy'])
     assert.equal(d.footer, '/model haiku')
 
@@ -81,6 +81,16 @@ test('Ctrl+P opens the panel; effort and file buttons change state and read it b
     await tick(10)
     assert.deepEqual(JSON.parse(readFileSync('.claude/settings.local.json', 'utf8')).permissions.allow, ['Edit', 'Write'])
     assert.equal(sent.findLast(m => m.t === 'dialog_update' && m.label).label, '[x] file')
+
+    // mode: acc means accept edits; Shift+Tab until the status line says so
+    screens.current = '  ⏵⏵ accept edits on (shift+tab to cycle)'
+    screens.push(screens.current)
+    host.dispatch({ t: 'dialog_button', id: d.id, index: 10 })
+    await tick(60)
+    assert.ok(sent.some(m => m.t === 'press' && m.key === 'shift-tab'))
+    const labels = {}
+    for (const m of sent) if (m.t === 'dialog_update' && m.index != null && m.label) labels[m.index] = m.label
+    assert.deepEqual([labels[9], labels[10], labels[11]], ['○ plan', '● acc', '○ auto'])
 
     // bash output: hides via pi.sed
     host.dispatch({ t: 'dialog_button', id: d.id, index: 14 })

@@ -1,11 +1,17 @@
 // Chrome tabs (P5) + pi.ext.f12.
 //   `//` + Tab      fzf over the open tabs (title — host); the pick is
-//                   screenshotted to $TMPDIR and typed as `@/tmp/….png`.
+//                   screenshotted to $TMPDIR and typed as `@/tmp/….png`
+//                   plus `@/tmp/….f12.md`: its URL, what F12 shows
+//                   (console, exceptions, network errors) and how to reach
+//                   the same tab through the chrome-devtools MCP.
 //   `//gh/` + Tab   URLs from the tabs and Chrome's history whose host
 //                   matches `gh` (github.com), typed as-is.
 // Every site picked either way goes into ~/.F12-mcp.json's allowedUrlPattern
 // (pi.ext.f12.addTrust), the config of the chrome-devtools MCP that gives
 // Claude the browser; the first `//` offers that MCP's install command.
+// pi.ext.f12.devtools(urlOrTargetId, {reload, ms}) reads a tab's live F12
+// (console, exceptions, network errors) for plugins and for `%%js` cells
+// (goal-v1.ipynb) driven through scripts/cdp-eval.mjs.
 // Chrome must have remote debugging allowed (chrome://inspect/#remote-debugging);
 // CLAUDE_P_CDP=<port|url> points at another browser (agent tests: 9224).
 import { existsSync } from 'node:fs'
@@ -60,6 +66,18 @@ export function tabItems(targets) {
   })
 }
 
+/** The tab a key names: its targetId, its URL exactly, or a URL prefix. */
+export function tabByKey(targets, key) {
+  key = String(key ?? '')
+  if (!key) return null
+  return (
+    targets.find(t => t.targetId === key) ??
+    targets.find(t => t.url === key) ??
+    targets.find(t => t.url.startsWith(key)) ??
+    null
+  )
+}
+
 /** allowedUrlPattern for a page: its origin, any path. null for non-web URLs. */
 export function trustPattern(url) {
   try {
@@ -97,6 +115,27 @@ export function mcpInstalled(claudeJson) {
   return scopes.some(s => s && 'chrome-devtools' in s)
 }
 
+/**
+ * The `.f12.md` handed to Claude with a tab's screenshot. `entries` from
+ * cdp.devtools (null: couldn't read them); the last `max` are kept.
+ */
+export function f12Report({ title, url, png, entries, mcp, max = 60 }) {
+  const lines = [`# Chrome tab: ${title || url}`, '', `URL: ${url}`, `Screenshot: ${png}`, '']
+  lines.push(
+    mcp
+      ? 'This tab is open in the user\'s Chrome. For more than this snapshot (DOM, network, scripts, clicks) use the chrome-devtools MCP: list_pages, then select_page on this URL.'
+      : 'This tab is open in the user\'s Chrome. (The chrome-devtools MCP is not installed, so this snapshot is all there is.)',
+    '',
+  )
+  if (!entries) return [...lines, 'DevTools: could not read the console.', ''].join('\n')
+  const cut = s => (s.length > 400 ? `${s.slice(0, 400)}…` : s)
+  const kept = entries.slice(-max)
+  lines.push(`## DevTools console (${entries.length}${entries.length > kept.length ? `, last ${kept.length}` : ''})`, '')
+  if (!kept.length) lines.push('(empty)')
+  for (const e of kept) lines.push(`- [${e.kind === 'console' ? e.level : `${e.kind} ${e.level}`}] ${cut(e.text.replace(/\s*\n\s*/g, ' ⏎ '))}${e.at ? `  (${e.at})` : ''}`)
+  return [...lines, ''].join('\n')
+}
+
 const copy = (pi, text) => pi.sh`printf %s ${text} | (wl-copy || xclip -selection clipboard || pbcopy) 2>/dev/null`
 
 /**
@@ -112,7 +151,8 @@ export const f12 = ({ home = homedir(), env = process.env, cdp = cdpLib, shots =
       pi.dialog({ body: `allowedUrlPattern not updated: ${e.message}`, timeout: 4000 })
     }
   }
-  pi.ext.f12 = { addTrust: trust }
+  const ext = { addTrust: trust }
+  pi.ext.f12 = ext
 
   // chrome-devtools-mcp --config fails when the file is missing. `{}`, not an
   // empty allowedUrlPattern: the MCP rejects an empty list.
@@ -154,6 +194,24 @@ export const f12 = ({ home = homedir(), env = process.env, cdp = cdpLib, shots =
       'Copy URL': () => void copy(pi, inspectUrl),
       OK: () => {},
     })
+
+  /** Live F12 for a tab (`url`, URL prefix, or targetId); null if there is none. */
+  const devtools = async (target, { reload = false, ms = 300 } = {}) => {
+    const b = await open()
+    if (!b?.cdp) {
+      offline()
+      return null
+    }
+    const t = tabByKey(await cdp.tabs(b.cdp).catch(() => []), target)
+    if (!t) {
+      pi.dialog({ body: `No Chrome tab for ${target}`, timeout: 4000 })
+      return null
+    }
+    // A reload starts the console over, so the replay is the fresh page's.
+    if (reload) await cdp.reload(b.cdp, t.targetId).catch(() => {})
+    return cdp.devtools(b.cdp, t.targetId, ms)
+  }
+  ext.devtools = devtools
 
   // First `//`: offer the chrome-devtools MCP (its --config file has to exist first).
   const offerMcp = async () => {
@@ -205,12 +263,14 @@ export const f12 = ({ home = homedir(), env = process.env, cdp = cdpLib, shots =
         pi.dialog({ body: `screenshot failed: ${e.message}`, timeout: 4000 })
         return null
       }
-      const file = join(shots, `cld-pi-${bareHost(t.url).replace(/[^\w.-]/g, '_') || 'tab'}-${Date.now()}.png`)
-      await writeFile(file, png)
+      const base = join(shots, `cld-pi-${bareHost(t.url).replace(/[^\w.-]/g, '_') || 'tab'}-${Date.now()}`)
+      await writeFile(`${base}.png`, png)
+      const entries = await cdp.devtools(b.cdp, t.targetId).catch(() => null)
+      await writeFile(`${base}.f12.md`, f12Report({ title: t.title, url: t.url, png: `${base}.png`, entries, mcp: await installed() }))
       const p = trustPattern(t.url)
       if (p) await trust(p)
       offerMcp().catch(() => {})
-      return `@${file}`
+      return `@${base}.png @${base}.f12.md`
     },
   )
 }
