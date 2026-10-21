@@ -1,0 +1,34 @@
+# Build outputs
+zig-out/
+.zig-cache/
+
+# Source (not needed for the npm consumer — the prebuilt binary is downloaded)
+src/
+tests/
+build.zig
+build.zig.zon
+
+# Docs
+SPEC.md
+CLAUDE.md
+REPORT.md
+
+# VCS
+.git/
+.gitignore
+.gitmodules
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Sidecar tests
+js/test/
+
+# Planning docs
+goal-v1.md
+goal-v1.ts
+mise.toml

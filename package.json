@@ -1,0 +1,48 @@
+{
+  "name": "cld-pi",
+  "version": "0.2.0",
+  "description": "claude-p fork: `claude -p` drop-in plus an interactive TUI shell around Claude Code (fullscreen), with prefix completion, overlays and JS plugins.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "cli",
+    "tui",
+    "zig",
+    "pty",
+    "zmux",
+    "ghostty"
+  ],
+  "license": "MIT",
+  "bin": {
+    "claude-p": "bin/claude-p.js"
+  },
+  "files": [
+    "bin/claude-p.js",
+    "scripts/install.js",
+    "js/",
+    "!js/test/",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js",
+    "test": "zig build test && node --test js/test/*.test.js",
+    "build": "zig build -Doptimize=ReleaseSafe",
+    "release": "node scripts/publish.mjs",
+    "release:dry-run": "node scripts/publish.mjs --dry-run",
+    "release:local": "node scripts/publish.mjs --local-only"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

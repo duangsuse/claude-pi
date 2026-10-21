@@ -40,6 +40,7 @@ capturing the final assistant message via a `Stop` hook, and emitting it in
 ```bash
 # Unit tests (no external deps).
 zig build test
+node --test js/test/*.test.js
 
 # End-to-end against the real `claude` binary (must be on $PATH).
 CLAUDE_P_E2E=1 zig build test-integration
@@ -63,8 +64,29 @@ runs the real `claude` binary.
 | `src/transcript.zig` | Session JSONL parser. |
 | `src/emit.zig` | Output formatters. |
 | `tests/integration.zig` | Real-claude end-to-end tests (gated). |
+| `src/pi/main.zig` | Interactive mode (no args): raw passthrough, hook FIFO, `scr` dump. |
+| `src/pi/grid.zig` | ghostty-vt grid mirroring CC's screen. |
+| `src/pi/term.zig` | Raw mode, winsize, SIGWINCH self-pipe. |
+| `src/pi/sidecar.zig` | Spawns `js/host.js`, JSON-lines RPC. |
+| `js/host.js`, `js/rpc.js` | node sidecar; plugin API grows here (see `goal-v1.ts`). |
+| `goal-v1.md` | Interactive-mode design + phases (P0–P6). |
 
 ## Gotchas
+
+- **Interactive mode (`src/pi/`) must not use `terminal.zig`.** The real
+  terminal answers CC's DEC queries; fake replies would double up.
+- **zmux never emits `session_exited` on pty EOF** — it only marks the
+  session `.terminated`. `pi/main.zig` polls `state()` and calls
+  `handle.reapExited()` to get the exit code.
+- **Native glibc link fails on Zig 0.15** with newer toolchains
+  (`unhandled relocation type R_X86_64_PC64 ... .sframe`). `build.zig`
+  defaults Linux to musl for that reason.
+- **Fetching deps behind an HTTP proxy**: Zig 0.15's client often fails
+  through `HTTPS_PROXY`. Download the tarball with curl and `zig fetch <file>`;
+  the content hash is identical.
+- **ghostty requests many lazy deps** (fonts, gtk, …) at configure time even
+  though only `ghostty-vt` is used. They're downloaded once into the cache;
+  nothing from them is compiled.
 
 - **Don't call back into zmux from inside the EventSink callback for the
   same session.** The reader thread runs the callback; re-entering

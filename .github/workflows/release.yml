@@ -1,0 +1,52 @@
+name: Release
+
+# Triggers on tag push (e.g. `git push origin v0.0.2`). Cross-compiles the
+# Zig binary for every supported target on a single Linux runner (zig
+# cross-compiles natively), uploads each as a GitHub release asset, then
+# publishes the npm package which downloads them via postinstall.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write   # for `gh release create`
+  id-token: write   # for npm provenance
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify tag matches package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $tag does not match package.json $pkg"
+            exit 1
+          fi
+
+      - name: zig build test
+        run: zig build test
+
+      - name: Release (build prebuilts, GH release, npm publish)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/publish.mjs --skip-git --skip-tests

@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+prebuilt/
+prebuilt-stage-*/
+release-assets/
+node_modules/
+.DS_Store

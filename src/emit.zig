@@ -1,0 +1,192 @@
+//! Output formatters that mirror `claude -p`'s wire format on stdout.
+//!
+//!   --output-format text         → final assistant text + "\n"
+//!   --output-format json         → one result object
+//!   --output-format stream-json  → JSONL replay of the transcript
+const std = @import("std");
+const transcript_mod = @import("transcript.zig");
+const Summary = transcript_mod.Summary;
+const args_mod = @import("args.zig");
+pub const OutputFormat = args_mod.OutputFormat;
+
+pub const ResultEnvelope = struct {
+    summary: *const Summary,
+    duration_ms: u64,
+};
+
+pub fn emit(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    fmt: OutputFormat,
+    env: ResultEnvelope,
+) !void {
+    switch (fmt) {
+        .text => try emitText(writer, env),
+        .json => try emitJson(allocator, writer, env),
+        .stream_json => try emitStreamJson(allocator, writer, env),
+    }
+}
+
+pub fn emitText(writer: *std.Io.Writer, env: ResultEnvelope) !void {
+    try writer.writeAll(env.summary.final_text);
+    if (env.summary.final_text.len == 0 or
+        env.summary.final_text[env.summary.final_text.len - 1] != '\n')
+    {
+        try writer.writeAll("\n");
+    }
+}
+
+pub fn emitJson(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    env: ResultEnvelope,
+) !void {
+    _ = allocator;
+    const s = env.summary;
+    var jw = std.json.Stringify{ .writer = writer, .options = .{} };
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("result");
+    try jw.objectField("subtype");
+    try jw.write(if (s.is_error) "error" else "success");
+    try jw.objectField("session_id");
+    try jw.write(s.session_id);
+    try jw.objectField("result");
+    try jw.write(s.final_text);
+    try jw.objectField("is_error");
+    try jw.write(s.is_error);
+    try jw.objectField("duration_ms");
+    try jw.write(env.duration_ms);
+    try jw.objectField("duration_api_ms");
+    try jw.write(s.duration_api_ms);
+    try jw.objectField("num_turns");
+    try jw.write(s.num_turns);
+    try jw.objectField("total_cost_usd");
+    try jw.write(s.total_cost_usd);
+    try jw.objectField("usage");
+    try jw.beginObject();
+    try jw.objectField("input_tokens");
+    try jw.write(s.usage.input_tokens);
+    try jw.objectField("output_tokens");
+    try jw.write(s.usage.output_tokens);
+    try jw.objectField("cache_read_input_tokens");
+    try jw.write(s.usage.cache_read_input_tokens);
+    try jw.objectField("cache_creation_input_tokens");
+    try jw.write(s.usage.cache_creation_input_tokens);
+    try jw.endObject();
+    try jw.objectField("permission_denials");
+    try jw.beginArray();
+    try jw.endArray();
+    try jw.endObject();
+    try writer.writeAll("\n");
+}
+
+pub fn emitStreamJson(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    env: ResultEnvelope,
+) !void {
+    // Stream-json is just JSONL replay of the transcript, ending with a
+    // `result` event of the same shape as `emitJson`.
+    try writer.writeAll(env.summary.jsonl_replay);
+    // Ensure replay ends with a newline before appending the result line.
+    if (env.summary.jsonl_replay.len == 0 or
+        env.summary.jsonl_replay[env.summary.jsonl_replay.len - 1] != '\n')
+    {
+        try writer.writeAll("\n");
+    }
+    try emitJson(allocator, writer, env);
+}
+
+// -------- tests --------
+
+const testing = std.testing;
+
+fn parseAndEmit(
+    allocator: std.mem.Allocator,
+    fmt: OutputFormat,
+    jsonl: []const u8,
+) ![]u8 {
+    var s = try transcript_mod.parse(allocator, jsonl);
+    defer s.deinit(allocator);
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    try emit(allocator, &aw.writer, fmt, .{ .summary = &s, .duration_ms = 100 });
+    buf = aw.toArrayList();
+    return try buf.toOwnedSlice(allocator);
+}
+
+test "emit text: final message + newline" {
+    const jsonl =
+        \\{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"hi"}]}}
+        \\
+    ;
+    const out = try parseAndEmit(testing.allocator, .text, jsonl);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("hi\n", out);
+}
+
+test "emit text: does not double-newline if text already ends with newline" {
+    const jsonl =
+        \\{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"hi\n"}]}}
+        \\
+    ;
+    const out = try parseAndEmit(testing.allocator, .text, jsonl);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("hi\n", out);
+}
+
+test "emit json: result object shape" {
+    const jsonl =
+        \\{"type":"assistant","session_id":"sid","message":{"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":2,"output_tokens":1}}}
+        \\
+    ;
+    const out = try parseAndEmit(testing.allocator, .json, jsonl);
+    defer testing.allocator.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("result", obj.get("type").?.string);
+    try testing.expectEqualStrings("success", obj.get("subtype").?.string);
+    try testing.expectEqualStrings("sid", obj.get("session_id").?.string);
+    try testing.expectEqualStrings("ok", obj.get("result").?.string);
+    try testing.expect(!obj.get("is_error").?.bool);
+    try testing.expectEqual(@as(i64, 100), obj.get("duration_ms").?.integer);
+    const usage = obj.get("usage").?.object;
+    try testing.expectEqual(@as(i64, 2), usage.get("input_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 1), usage.get("output_tokens").?.integer);
+}
+
+test "emit json: error result" {
+    const jsonl =
+        \\{"type":"assistant","session_id":"e","message":{"content":[{"type":"text","text":"boom"}]}}
+        \\{"type":"result","subtype":"error","session_id":"e","result":"boom","is_error":true}
+        \\
+    ;
+    const out = try parseAndEmit(testing.allocator, .json, jsonl);
+    defer testing.allocator.free(out);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("error", parsed.value.object.get("subtype").?.string);
+    try testing.expect(parsed.value.object.get("is_error").?.bool);
+}
+
+test "emit stream-json: replay + trailing result" {
+    const jsonl =
+        \\{"type":"system","subtype":"init","session_id":"s"}
+        \\{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"go"}]}}
+        \\
+    ;
+    const out = try parseAndEmit(testing.allocator, .stream_json, jsonl);
+    defer testing.allocator.free(out);
+    // First two lines are the original events; third is the result envelope.
+    var iter = std.mem.splitScalar(u8, out, '\n');
+    const line1 = iter.next().?;
+    const line2 = iter.next().?;
+    const line3 = iter.next().?;
+    try testing.expect(std.mem.indexOf(u8, line1, "\"subtype\":\"init\"") != null);
+    try testing.expect(std.mem.indexOf(u8, line2, "\"type\":\"assistant\"") != null);
+    try testing.expect(std.mem.indexOf(u8, line3, "\"type\":\"result\"") != null);
+}

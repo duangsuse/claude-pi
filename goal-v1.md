@@ -96,7 +96,7 @@ echo 'claude-p-w(){ BUFFER=claude-p; zle accept-line }; zle -N claude-p-w; bindk
 
 | 阶段 | 内容 | Zig | JS | 验收 |
 |---|---|---|---|---|
-| **P0 底座** | fork；0 参数进入 `src/pi/`；raw 模式双向透传；SIGWINCH；ghostty-vt；每帧写 `scr`；强制 fullscreen；首次运行打印 rc 命令；node sidecar 和 RPC 骨架；打包流程加入 `js/` | 450 | 120 | `claude-p` 打开后和直接运行 `claude` 体验一致，`scr` 内容和屏幕一致 |
+| **P0 底座** ✅ | fork；0 参数进入 `src/pi/`；raw 模式双向透传；SIGWINCH；ghostty-vt；每帧写 `scr`；强制 fullscreen；首次运行打印 rc 命令；node sidecar 和 RPC 骨架；打包流程加入 `js/` | 450 | 120 | `claude-p` 打开后和直接运行 `claude` 体验一致，`scr` 内容和屏幕一致 |
 | **P1 输入核心** | 识别输入框（边框、占位符的灰色 SGR）；Ctrl+C 两种语义；Tab 前缀路由，fzf 在真实 tty 运行后按网格重绘；`./`、`/~/` 补全插入 `@`；只输路径时回车 cd，不存在则新建，之后 `/clear` | 400 | 120 | 补全、清行、cd 三个场景各手测 10 次无错乱 |
 | **P2 叠加层和按键** | gum 风格的下拉菜单、dialog、涂抹层（同步输出，CC 每帧画完后重新涂）；kitty 键盘协议；Ctrl+Enter 粘贴执行；hook 事件接 notify-send | 500 | 60 | CC 正在流式输出时打开 dialog 不闪烁，关闭后画面完全恢复 |
 | **P3 插件系统和默认插件** | 插件 API；加载 `~/claude/-p/*.js`；`/m`、`/w`、`/ad` | 150 | 350 | 写一个用户插件能自动加载，3 个默认命令都能用 |
@@ -114,4 +114,4 @@ echo 'claude-p-w(){ BUFFER=claude-p; zle accept-line }; zle -N claude-p-w; bindk
 - **涂抹层在 CC 高频刷帧时可能闪烁**：必须用同步输出，在同一次 write 里把 CC 的帧和涂抹一起发出去。
 - **`! cd` 在允许目录之外会被 CC 重置回原目录**，所以先 `/add-dir`。
 - **allowedUrlPattern 需要 Chrome 149+**；不在白名单里的标签页会被 MCP 静默断开。
-- **构建尚未实测**：沙箱拒绝执行未经审查的下载代码，P0 第一步就是用 Zig 0.15.2 跑通 `zig build`。
+- ~~**构建尚未实测**~~：P0 已用 Zig 0.15.2 跑通 `zig build`（Linux 默认 musl，见 CLAUDE.md Gotchas）。ghostty-vt 固定在 v1.3.1（最后一个支持 0.15.2 的 tag）。
