@@ -21,16 +21,22 @@ type On = ((handlers: Partial<Events>) => () => void) & {
 }
 
 /**
+ * 按钮回调：单参函数。row1 由 DSL 解析得到，插件不需要自己传；
+ * 返回字符串时，用它更新按钮文字（可以用来做 checkbox）。
+ */
+type Button = (row1: string) => string | void
+
+/**
  * gum 风格的多行 dialog。
- * 除 title/body/footer 外，其余键都是按钮：键名是按钮文字，值是回调。
- * 回调的 row1 由 DSL 解析得到，插件不需要自己传；回调返回字符串时，用它更新按钮文字（可以用来做 checkbox）。
+ * 除 title/body/footer 外，其余键都是按钮：键名是按钮文字，值是 Button。
+ * 没有硬编码的 OK，`OK` 只是一个叫 OK 的普通按钮。
  */
 type Dialog = {
   title?: string
   body?: string
   footer?: string
-  OK?(row1: string): string | void
-  [button: string]: unknown
+} & {
+  [button: string]: Button
 }
 
 /** pi.htmlJSONL 返回的通道：收消息、发消息 */
@@ -40,8 +46,18 @@ type Channel = {
 }
 
 interface Pi {
-  /** tagged template 写入 pty：pi`/add-dir ${dir}\r` */
+  /**
+   * tagged template：用这一行替换输入框内容并回车，pi`/add-dir ${dir}`。
+   * 暂时用 String.raw 处理：反斜杠原样写入。
+   */
   (strings: TemplateStringsArray, ...values: unknown[]): Promise<void>
+
+  /** 替换输入框内容，不回车（类似 zsh 的 BUFFER）。先做成只写，读取得到 undefined */
+  BUFFER: string
+
+  /** wrapper 的可调参数。fzf：附加在内置参数之后的 fzf 参数（shell 语法），
+   *  默认 `--pointer '▶' --bind 'ctrl-d:become(dirname -- {})'`（ctrl-d 选中当前项所在的文件夹） */
+  arg: { fzf: string }
 
   /** 注册伪命令 /name */
   command(name: string, run: (args: string[]) => unknown): void
@@ -49,6 +65,11 @@ interface Pi {
   complete(prefix: string, source: (tok: string) => Promise<string[]> | string[]): void
   on: On
   dialog(d: Dialog): Promise<void>
+  /**
+   * 鼠标点击网格某一行时回调，i_row 是屏幕行号（0 起）。
+   * 点在输入框箭头（❯）那一行及其下方的不算：输入框、状态栏的点击照常交给 CC。
+   */
+  click(handler: (i_row: number) => void): () => void
   notify(msg: string): void        // notify-send
 
   // P2：逐行处理网格。返回字符串就把这一行涂成该文本，返回 null 就涂掉。不改写 CC 的输出字节流
@@ -57,8 +78,8 @@ interface Pi {
   // P6：消息边界和 scrollInView
   mark(name?: string): void
   scrollTo(name: string): Promise<void>
-  /** 用 chrome --app 小窗口打开 WebUI，返回双向 JSON 通道 */
-  htmlJSONL(strings: TemplateStringsArray, ...values: unknown[]): Channel
+  /** 用 chrome --app 小窗口打开 WebUI，返回双向 JSON 通道。普通函数，不做模板注入 */
+  htmlJSONL(html: string): Channel
 
   ext: {
     f12: { addTrust(allowedUrlPattern: string): Promise<void> }   // 追加到 ~/.F12-mcp.json
@@ -69,11 +90,14 @@ interface Pi {
 
 // ---- 示例插件 ----
 export default (pi: Pi) => {
-  pi.command('ad', async ([dir]) => { await pi`/add-dir ${dir}\r`; await pi`!tree -L 2 ${dir}\r` })
+  pi.command('ad', async ([dir]) => { await pi`/add-dir ${dir}`; await pi`!tree -L 2 ${dir}` })
   pi.complete('//', async (tok) => [])
   pi.on({ stop(payload) {}, CtrlC() {} })
   pi.on({ scrcpy(s) {} })
-  pi.dialog({ title: 'T', body: '...', footer: '', OK(row1) {} })
+  pi.dialog({ title: 'T', body: '...', footer: '', OK(row1) {}, '[ ] web': row1 => '[x] web' })
+  pi.click(i_row => {})
+  pi.BUFFER = '草稿，不回车'
+  pi.arg.fzf = "--pointer '▶' --height=60%"
   pi.notify('done')
 
   // P2
@@ -83,7 +107,7 @@ export default (pi: Pi) => {
   pi.mark('last')
   pi.on({ user(msg) { pi.mark() } })
   pi.scrollTo('last')
-  const s = pi.htmlJSONL`WebUI content`
+  const s = pi.htmlJSONL('<h1>WebUI content</h1>')
   s(json => {})
   s('send json')
 

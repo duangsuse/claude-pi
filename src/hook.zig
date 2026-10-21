@@ -203,6 +203,11 @@ pub fn extractLastAssistantMessage(allocator: std.mem.Allocator, payload_json: [
     return try extractStringField(allocator, payload_json, "last_assistant_message");
 }
 
+/// Pull `cwd` out of any hook payload.
+pub fn extractCwd(allocator: std.mem.Allocator, payload_json: []const u8) !?[]u8 {
+    return try extractStringField(allocator, payload_json, "cwd");
+}
+
 /// Pull `session_id` out of a Stop/SessionStart hook payload.
 pub fn extractSessionId(allocator: std.mem.Allocator, payload_json: []const u8) !?[]u8 {
     return try extractStringField(allocator, payload_json, "session_id");

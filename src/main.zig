@@ -11,8 +11,11 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, argv_raw);
     const argv = argv_raw[1..];
 
-    // No arguments: interactive TUI wrapper around `claude` (src/pi/).
-    if (argv.len == 0) std.process.exit(try claude_p.pi.run(allocator));
+    // No arguments (or only -r/-c) on a terminal: interactive TUI wrapper
+    // around `claude` (src/pi/).
+    if (claude_p.pi.wantsInteractive(argv) and std.posix.isatty(0)) {
+        std.process.exit(try claude_p.pi.run(allocator, argv));
+    }
 
     var opts = claude_p.args.parse(allocator, argv) catch |err| {
         try printError(err);

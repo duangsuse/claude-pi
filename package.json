@@ -15,6 +15,7 @@
   ],
   "license": "MIT",
   "bin": {
+    "cld-pi": "bin/claude-p.js",
     "claude-p": "bin/claude-p.js"
   },
   "files": [

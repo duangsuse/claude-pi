@@ -108,7 +108,10 @@ fn isKnownBoolean(flag: []const u8) bool {
 }
 
 const help_text =
-    \\Usage: claude-p [OPTIONS] [PROMPT]
+    \\Usage: claude-p                           interactive TUI around claude
+    \\       claude-p -r [id] | -c                 interactive, resume / continue
+    \\       claude-p [OPTIONS] [PROMPT]
+    \\       claude-p .json [OPTIONS] [PROMPT]     .text/.json/.stream-json = --output-format
     \\       claude-p daemon [OPTIONS]
     \\
     \\Default mode: one-shot. Emulates `claude -p` by driving the interactive
@@ -136,7 +139,7 @@ const help_text =
     \\  --add-dir <dir>...              Additional allowed directories (repeatable, variadic)
     \\  --mcp-config <cfg>...           MCP server config files / JSON (repeatable, variadic)
     \\  --setting-sources <sources>     Comma-separated: user,project,local
-    \\  --resume <id>                   Resume a session
+    \\  -r, --resume <id>               Resume a session
     \\  --continue, -c                  Continue the most recent session
     \\  --session-id <uuid>             Use a specific session UUID
     \\  --cwd <path>                    Working directory for `claude`
@@ -207,6 +210,11 @@ pub fn parse(allocator: std.mem.Allocator, argv_in: []const []const u8) ParseErr
             opts.output_format = OutputFormat.fromString(argv[i]) orelse return ParseError.BadOutputFormat;
         } else if (std.mem.startsWith(u8, a, "--output-format=")) {
             opts.output_format = OutputFormat.fromString(a["--output-format=".len..]) orelse return ParseError.BadOutputFormat;
+        } else if (a.len > 1 and a[0] == '.' and OutputFormat.fromString(a[1..]) != null) {
+            // Shorthand: `cld-pi .json 'prompt'` == `--output-format json`.
+            // `.stream-json` implies --verbose, which claude requires for it.
+            opts.output_format = OutputFormat.fromString(a[1..]).?;
+            if (opts.output_format == .stream_json) opts.verbose = true;
         } else if (std.mem.eql(u8, a, "--model")) {
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
@@ -223,7 +231,7 @@ pub fn parse(allocator: std.mem.Allocator, argv_in: []const []const u8) ParseErr
             opts.allowed_tools = argv[i];
         } else if (std.mem.eql(u8, a, "--dangerously-skip-permissions")) {
             opts.dangerously_skip_permissions = true;
-        } else if (std.mem.eql(u8, a, "--resume")) {
+        } else if (std.mem.eql(u8, a, "--resume") or std.mem.eql(u8, a, "-r")) {
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
             opts.resume_session = argv[i];
@@ -442,6 +450,30 @@ test "parse: --resume value" {
     var opts = try parse(testing.allocator, &.{ "--resume", "550e8400-e29b-41d4-a716-446655440000" });
     defer opts.deinit(testing.allocator);
     try testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", opts.resume_session.?);
+}
+
+test "parse: -r alias for --resume" {
+    var opts = try parse(testing.allocator, &.{ "-r", "abc", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("abc", opts.resume_session.?);
+    try testing.expectEqualStrings("hi", opts.prompt.?);
+}
+
+test "parse: .json / .stream-json shorthands" {
+    var opts = try parse(testing.allocator, &.{ ".json", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqual(OutputFormat.json, opts.output_format);
+    try testing.expectEqualStrings("hi", opts.prompt.?);
+
+    var opts2 = try parse(testing.allocator, &.{ ".stream-json", "hi" });
+    defer opts2.deinit(testing.allocator);
+    try testing.expectEqual(OutputFormat.stream_json, opts2.output_format);
+    try testing.expect(opts2.verbose);
+
+    // Not a known format: stays a prompt.
+    var opts3 = try parse(testing.allocator, &.{".yaml"});
+    defer opts3.deinit(testing.allocator);
+    try testing.expectEqualStrings(".yaml", opts3.prompt.?);
 }
 
 test "parse: --input-file" {

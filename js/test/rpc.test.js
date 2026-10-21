@@ -10,12 +10,36 @@ test('lineSplitter handles split and batched chunks', () => {
   assert.deepEqual(lines, ['{"a":1}', '{"b":2}', '{"c":3}'])
 })
 
-test('pi`` sends a write message with interpolation', async () => {
+test('pi`` submits the line (Enter is added on the Zig side)', async () => {
   const sent = []
   const { pi } = createHost(m => sent.push(m))
   const dir = '/tmp/x'
-  await pi`/add-dir ${dir}\r`
-  assert.deepEqual(sent, [{ t: 'write', data: '/add-dir /tmp/x\r' }])
+  await pi`/add-dir ${dir}`
+  await pi`echo a\nb`
+  // String.raw: the backslash sequence is not cooked.
+  assert.deepEqual(sent, [
+    { t: 'submit', data: '/add-dir /tmp/x' },
+    { t: 'submit', data: 'echo a\\nb' },
+  ])
+})
+
+test('pi.BUFFER is write-only', () => {
+  const sent = []
+  const { pi } = createHost(m => sent.push(m))
+  pi.BUFFER = 'draft'
+  assert.deepEqual(sent, [{ t: 'buffer', data: 'draft' }])
+  assert.equal(pi.BUFFER, undefined)
+})
+
+test('pi.arg: defaults from init, assignments go to Zig', () => {
+  const sent = []
+  const { pi, dispatch } = createHost(m => sent.push(m))
+  dispatch({ t: 'init', cols: 80, rows: 24, arg: { fzf: '--pointer x' } })
+  assert.equal(pi.arg.fzf, '--pointer x')
+  assert.deepEqual(sent, [])
+  pi.arg.fzf = '--height=20%'
+  assert.equal(pi.arg.fzf, '--height=20%')
+  assert.deepEqual(sent, [{ t: 'arg', key: 'fzf', value: '--height=20%' }])
 })
 
 test('hook events reach pi.on handlers and awaitable pi.on.xxx', async () => {

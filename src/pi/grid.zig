@@ -35,6 +35,34 @@ pub const Grid = struct {
         return self.term.screens.active_key == .alternate;
     }
 
+    /// VT bytes that repaint the real terminal from the grid: screen,
+    /// styles, cursor and modes (alt screen, mouse, bracketed paste, …).
+    /// Used after something else (fzf) took over the terminal. Wrapped in
+    /// synchronized output so it lands as one frame. No palette: that's the
+    /// user's terminal's business.
+    pub fn redraw(self: *Grid, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const w = &out.writer;
+        try w.writeAll("\x1b[?2026h");
+        if (self.onAltScreen()) try w.writeAll("\x1b[?1049h");
+        try w.writeAll("\x1b[0m\x1b[H\x1b[2J");
+        var f: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt, .trim = false });
+        f.extra = .none;
+        f.extra.modes = true;
+        f.extra.keyboard = true;
+        f.extra.screen = .none;
+        f.extra.screen.cursor = true;
+        f.extra.screen.style = true;
+        try w.print("{f}", .{f});
+        // Kitty flags go back as a push, not the formatter's `CSI = f;1 u`:
+        // tmux ignores the set form, and CC pops its entry on exit anyway.
+        const kitty = self.term.screens.active.kitty_keyboard.current().int();
+        if (kitty != 0) try w.print("\x1b[>{d}u", .{kitty});
+        try w.writeAll("\x1b[?2026l");
+        return out.toOwnedSlice();
+    }
+
     /// Plain-text viewport, exactly `rows` lines (line N == screen row N).
     pub fn snapshot(self: *Grid, allocator: std.mem.Allocator) ![]u8 {
         const text = try self.term.plainString(allocator);
@@ -80,4 +108,47 @@ test "resize keeps working" {
     const s = try g.snapshot(testing.allocator);
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("\n\n\n\n\nbottom\n", s);
+}
+
+test "redraw reproduces screen, cursor and alt screen" {
+    inline for (.{ "multiline", "at_popup", "busy" }) |name| {
+        const a = try Grid.create(testing.allocator, 100, 30);
+        defer a.destroy(testing.allocator);
+        a.feed(@embedFile("testdata/" ++ name ++ ".vt"));
+        const bytes = try a.redraw(testing.allocator);
+        defer testing.allocator.free(bytes);
+
+        const b = try Grid.create(testing.allocator, 100, 30);
+        defer b.destroy(testing.allocator);
+        // Start from a primary screen with junk on it, like after fzf exits.
+        b.feed("junk junk\r\n");
+        b.feed(bytes);
+
+        const sa = try a.snapshot(testing.allocator);
+        defer testing.allocator.free(sa);
+        const sb = try b.snapshot(testing.allocator);
+        defer testing.allocator.free(sb);
+        try testing.expectEqualStrings(sa, sb);
+        try testing.expectEqual(a.onAltScreen(), b.onAltScreen());
+        try testing.expectEqual(a.term.screens.active.cursor.x, b.term.screens.active.cursor.x);
+        try testing.expectEqual(a.term.screens.active.cursor.y, b.term.screens.active.cursor.y);
+        try testing.expectEqual(a.term.modes.get(.bracketed_paste), b.term.modes.get(.bracketed_paste));
+        try testing.expectEqual(a.term.modes.get(.mouse_event_any), b.term.modes.get(.mouse_event_any));
+    }
+}
+
+test "redraw restores kitty keyboard flags and modifyOtherKeys" {
+    const a = try Grid.create(testing.allocator, 20, 4);
+    defer a.destroy(testing.allocator);
+    a.feed("\x1b[?1049h\x1b[>5u\x1b[>4;2mhi");
+    const bytes = try a.redraw(testing.allocator);
+    defer testing.allocator.free(bytes);
+
+    const b = try Grid.create(testing.allocator, 20, 4);
+    defer b.destroy(testing.allocator);
+    // What fzf.prelude leaves behind.
+    b.feed("\x1b[<99u\x1b[=0;1u\x1b[>4;0m");
+    b.feed(bytes);
+    try testing.expectEqual(@as(u5, 5), b.term.screens.active.kitty_keyboard.current().int());
+    try testing.expect(b.term.flags.modify_other_keys_2);
 }

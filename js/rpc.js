@@ -63,19 +63,37 @@ export function createHost(send, log = () => {}) {
     },
   )
 
-  // pi`/add-dir ${dir}\r` writes raw bytes to the pty.
+  // pi`/add-dir ${dir}` replaces the input box text with the line, then Enter. String.raw
+  // for now: backslashes reach the pty as typed.
   const pi = async (strings, ...values) => {
-    // Cooked strings, so `\r` in the template is a real CR.
-    const data = strings.reduce((acc, s, i) => acc + s + (i < values.length ? String(values[i]) : ''), '')
-    send({ t: 'write', data })
+    send({ t: 'submit', data: String.raw(strings, ...values) })
   }
   pi.on = on
   pi.state = state
+
+  // pi.BUFFER = 'text' replaces the input box text, no Enter. Write-only
+  // for now (reading it back would need the grid).
+  Object.defineProperty(pi, 'BUFFER', {
+    set: v => send({ t: 'buffer', data: String(v) }),
+    enumerable: true,
+  })
+
+  // pi.arg.fzf = '...' : settings the Zig side uses. Defaults arrive with
+  // the init message; assignments are pushed back.
+  const args = {}
+  pi.arg = new Proxy(args, {
+    set(target, key, value) {
+      target[key] = String(value)
+      send({ t: 'arg', key, value: String(value) })
+      return true
+    },
+  })
 
   /** Handle one message from the Zig side. */
   const dispatch = msg => {
     switch (msg.t) {
       case 'init':
+        Object.assign(args, msg.arg)
         state.init = msg
         state.cols = msg.cols
         state.rows = msg.rows

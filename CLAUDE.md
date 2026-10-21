@@ -68,11 +68,43 @@ runs the real `claude` binary.
 | `src/pi/grid.zig` | ghostty-vt grid mirroring CC's screen. |
 | `src/pi/term.zig` | Raw mode, winsize, SIGWINCH self-pipe. |
 | `src/pi/sidecar.zig` | Spawns `js/host.js`, JSON-lines RPC. |
+| `src/pi/screen.zig` | **All** rules for reading CC's UI off the grid (input box, busy, …). |
+| `src/pi/input.zig` | Pure key logic: Tab prefixes, Ctrl+C plan, path → cd target. |
+| `src/pi/steps.zig` | Non-blocking queue of pty writes + waits (cd flow). |
+| `src/pi/fzf.zig` | fzf on the real tty (main.zig pauses output, repaints from grid). |
+| `src/pi/testdata/*.vt` | Raw CC output streams (100x30) replayed by screen/grid tests. |
+| `scripts/cc-probe.py` | Drive real CC through claude-p, record `.vt` + `scr` per step. |
+| `scripts/vt-view.mjs` | Page through `.vt` files (←/→) by replaying them. |
+| `scripts/cdp-eval.mjs` | Evaluate JS in a sidecar over CDP (default :9224), like F12. |
 | `js/host.js`, `js/rpc.js` | node sidecar; plugin API grows here (see `goal-v1.ts`). |
 | `goal-v1.md` | Interactive-mode design + phases (P0–P6). |
 
+## Agent testing (interactive mode)
+
+- The user may have a real claude-p running. **Agent tests use port 9224 for
+  every CDP endpoint** (sidecar inspector: `CLAUDE_P_INSPECT=9224`; the Chrome
+  remote-debugging port too, once P5 lands) and their own data dir
+  (`CLAUDE_P_DIR=...`). `scripts/cc-probe.py` sets both.
+- `cc-probe.py` has no terminal emulator in front of it: it can't show what
+  the user actually sees (fzf panels, repaints). For that run claude-p in
+  `tmux -L <own socket> new-session -x 100 -y 30 ...` and `capture-pane`.
+- Probes never submit a prompt unless a step does. Note `! cmd` and the cd
+  flow start a model turn (interrupted right away) — keep those runs few.
+- New CC screen states → record with cc-probe, copy the `.vt` into
+  `src/pi/testdata/` (scrub account details), add a `screen.zig` test.
+
 ## Gotchas
 
+- **Typing into CC from the wrapper**: a write glued to the previous one is
+  taken as a paste (`\r` → newline); text and `\r` split apart lets CC's
+  suggestion popup eat the Enter. `Keys.submit` = quiet gap, one write,
+  then Enter again if text is still in the box (a popup can still take the
+  first one — seen in tmux). Command lines that end in a path get a trailing
+  space so no suggestion pops up at all.
+- **CC is "busy" while a `!` command runs** (`⎿ Running…`). Esc then
+  cancels the command and puts it back in the box.
+- **`/clear` resets CC's cwd** to the start dir, so the cd flow does
+  /clear first, then `! cd`.
 - **Interactive mode (`src/pi/`) must not use `terminal.zig`.** The real
   terminal answers CC's DEC queries; fake replies would double up.
 - **zmux never emits `session_exited` on pty EOF** — it only marks the
