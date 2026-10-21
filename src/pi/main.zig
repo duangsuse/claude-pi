@@ -21,6 +21,8 @@ const screen = @import("screen.zig");
 const input = @import("input.zig");
 const steps = @import("steps.zig");
 const fzf = @import("fzf.zig");
+const overlay_mod = @import("overlay.zig");
+const convo = @import("convo.zig");
 
 pub const term_mod = term;
 pub const grid_mod = @import("grid.zig");
@@ -35,15 +37,20 @@ const scr_interval_ns: i64 = 30 * std.time.ns_per_ms;
 
 const hook_events = [_][]const u8{ "Notification", "Stop", "SessionStart" };
 
+/// CC exiting within this long after a forwarded Ctrl+C counts as "quit
+/// with Ctrl+C" (the second press of CC's press-twice-to-exit).
+const ctrl_c_exit_window_ns: i64 = 3 * std.time.ns_per_s;
+
 /// Quiet gap before a scripted command line (see Keys.submit); same figure
 /// as driver.ink_enter_debounce_ms.
 const enter_gap_ms: u32 = 120;
 
 const Shared = struct {
     allocator: std.mem.Allocator,
-    /// Guards `grid`, `paused` and ordering of stdout writes.
+    /// Guards `grid`, `overlay`, `paused` and ordering of stdout writes.
     mutex: std.Thread.Mutex = .{},
     grid: *Grid,
+    overlay: overlay_mod.Overlay,
     /// Something else (fzf) owns the terminal: keep feeding the grid but
     /// don't write CC's output to stdout. Repaint from the grid on resume.
     paused: bool = false,
@@ -51,6 +58,46 @@ const Shared = struct {
     dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     exit_code: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    /// Forward a CC chunk to the terminal (mutex held, grid already fed).
+    /// With an overlay up, the chunk and a fresh paint of the overlay go out
+    /// in one synchronized write, so no frame ever shows CC without it.
+    fn emit(self: *Shared, data: []const u8) void {
+        if (!self.overlay.active()) return term.writeAll(stdout_fd, data);
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(self.allocator);
+        self.composeFrame(&out, data, false) catch return term.writeAll(stdout_fd, data);
+        term.writeAll(stdout_fd, out.items);
+    }
+
+    /// Repaint everything from the grid plus overlays (mutex held): after
+    /// an overlay shrank or closed, the cells under it come back exactly.
+    fn repaint(self: *Shared) void {
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(self.allocator);
+        self.composeFrame(&out, "", true) catch return;
+        term.writeAll(stdout_fd, out.items);
+    }
+
+    /// Paint just the overlays (mutex held), e.g. a button got focus.
+    fn paintOverlay(self: *Shared) void {
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(self.allocator);
+        self.composeFrame(&out, "", false) catch return;
+        term.writeAll(stdout_fd, out.items);
+    }
+
+    fn composeFrame(self: *Shared, out: *std.ArrayList(u8), data: []const u8, full: bool) !void {
+        const a = self.allocator;
+        try out.appendSlice(a, "\x1b[?2026h");
+        try out.appendSlice(a, data);
+        if (full) try self.grid.redrawInto(a, out);
+        try self.overlay.render(out, self.grid.term.cols, self.grid.term.rows);
+        try self.grid.restoreCursor(a, out);
+        // CC re-shows its caret every frame; it would blink inside the dialog.
+        if (self.overlay.dialog != null) try out.appendSlice(a, "\x1b[?25l");
+        try out.appendSlice(a, "\x1b[?2026l");
+    }
 };
 
 fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
@@ -59,8 +106,8 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
         .pane_output => |po| {
             shared.mutex.lock();
             defer shared.mutex.unlock();
-            if (!shared.paused) term.writeAll(stdout_fd, po.data);
             shared.grid.feed(po.data);
+            if (!shared.paused) shared.emit(po.data);
             shared.dirty.store(true, .seq_cst);
             shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
         },
@@ -111,8 +158,13 @@ const Keys = struct {
     /// CC's current directory, from hook payloads and our own `! cd`.
     cwd: []u8,
     home: []const u8,
-    /// Directories CC may cd into without resetting: the root + /add-dir'd.
-    allowed: std.ArrayList([]u8) = .{},
+    /// Current session's transcript, from hook payloads (deleted on a
+    /// Ctrl+C exit).
+    transcript: ?[]u8 = null,
+    /// For overlay events (dialog buttons, menu picks, focus). Set in run().
+    side: ?*sidecar_mod.Sidecar = null,
+    /// The sidecar wants a `scr` message per dumped frame (pi.sed / scrcpy).
+    scr_subscribed: bool = false,
     /// `pi.arg.fzf` (owned once a plugin sets it).
     fzf_args: []const u8 = fzf.default_args,
     fzf_args_owned: bool = false,
@@ -120,7 +172,7 @@ const Keys = struct {
     fn init(allocator: std.mem.Allocator, shared: *Shared, session: *zmux.NativeSession) !Keys {
         const root = try std.process.getCwdAlloc(allocator);
         errdefer allocator.free(root);
-        var k: Keys = .{
+        return .{
             .allocator = allocator,
             .shared = shared,
             .session = session,
@@ -129,16 +181,13 @@ const Keys = struct {
             .cwd = try allocator.dupe(u8, root),
             .home = posix.getenv("HOME") orelse "/",
         };
-        try k.allowed.append(allocator, try allocator.dupe(u8, root));
-        return k;
     }
 
     fn deinit(self: *Keys) void {
         self.runner.deinit();
         self.allocator.free(self.project_root);
         self.allocator.free(self.cwd);
-        for (self.allowed.items) |a| self.allocator.free(a);
-        self.allowed.deinit(self.allocator);
+        if (self.transcript) |t| self.allocator.free(t);
         if (self.fzf_args_owned) self.allocator.free(self.fzf_args);
     }
 
@@ -147,6 +196,12 @@ const Keys = struct {
         if (self.fzf_args_owned) self.allocator.free(self.fzf_args);
         self.fzf_args = copy;
         self.fzf_args_owned = true;
+    }
+
+    fn setTranscript(self: *Keys, path: []const u8) void {
+        const copy = self.allocator.dupe(u8, path) catch return;
+        if (self.transcript) |t| self.allocator.free(t);
+        self.transcript = copy;
     }
 
     fn setCwd(self: *Keys, dir: []const u8) void {
@@ -161,15 +216,132 @@ const Keys = struct {
         return screen.inputBox(self.allocator, &self.shared.grid.term) catch null;
     }
 
+    fn send(self: *Keys, value: anytype) void {
+        if (self.side) |s| s.send(value);
+    }
+
     /// Returns true when `bytes` was handled here instead of going to CC.
+    /// An open dialog or menu takes every key; focus reports still reach CC.
     fn handle(self: *Keys, bytes: []const u8) bool {
+        const key = input.decode(bytes);
+        switch (key) {
+            .focus_in, .focus_out => {
+                self.send(.{ .t = "focus", .focused = key == .focus_in });
+                return false;
+            },
+            else => {},
+        }
+        self.shared.mutex.lock();
+        const modal: enum { none, dialog, menu } = if (self.shared.overlay.dialog != null) .dialog else if (self.shared.overlay.menu != null) .menu else .none;
+        self.shared.mutex.unlock();
+        switch (modal) {
+            .dialog => return self.onDialogKey(key),
+            .menu => return self.onMenuKey(key),
+            .none => {},
+        }
+        if (key == .mouse and key.mouse.press and key.mouse.button == 0) {
+            self.shared.mutex.lock();
+            const hit = self.shared.overlay.badgeHit(key.mouse.x, key.mouse.y, self.shared.grid.term.cols);
+            self.shared.mutex.unlock();
+            if (hit) {
+                self.send(.{ .t = "badge_click" });
+                return true;
+            }
+        }
         if (self.runner.active()) return false;
-        return switch (input.classify(bytes)) {
+        return switch (key) {
             .tab => self.onTab(),
             .ctrl_c => self.onCtrlC(),
             .enter => self.onEnter(),
-            .other => false,
+            .ctrl_enter => self.onCtrlEnter(),
+            else => false,
         };
+    }
+
+    /// ←/→/Tab move between buttons, Enter presses one (the sidecar decides
+    /// whether that closes the dialog), Esc / Ctrl+C dismiss it.
+    fn onDialogKey(self: *Keys, key: input.Key) bool {
+        const sh = self.shared;
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        const d = &(sh.overlay.dialog orelse return true);
+        const n = d.buttons.len;
+        switch (key) {
+            .left, .up, .shift_tab => if (n > 0) {
+                d.active = (d.active + n - 1) % n;
+                sh.paintOverlay();
+            },
+            .right, .down, .tab => if (n > 0) {
+                d.active = (d.active + 1) % n;
+                sh.paintOverlay();
+            },
+            .enter => if (n > 0) {
+                self.send(.{ .t = "dialog_button", .id = d.id, .index = d.active, .row1 = d.row1() });
+            } else self.dismissDialog(),
+            .esc, .ctrl_c => self.dismissDialog(),
+            else => {},
+        }
+        return true;
+    }
+
+    /// Mutex held.
+    fn dismissDialog(self: *Keys) void {
+        const id = self.shared.overlay.dialog.?.id;
+        self.shared.overlay.closeDialog();
+        self.shared.repaint();
+        self.send(.{ .t = "dialog_closed", .id = id });
+    }
+
+    fn onMenuKey(self: *Keys, key: input.Key) bool {
+        const sh = self.shared;
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        const m = &(sh.overlay.menu orelse return true);
+        const n = m.items.len;
+        const pick: ?usize = switch (key) {
+            .up, .shift_tab => {
+                m.active = (m.active + n - 1) % n;
+                sh.paintOverlay();
+                return true;
+            },
+            .down, .tab => {
+                m.active = (m.active + 1) % n;
+                sh.paintOverlay();
+                return true;
+            },
+            .enter => m.active,
+            .esc, .ctrl_c => null,
+            else => return true,
+        };
+        const id = m.id;
+        sh.overlay.closeMenu();
+        sh.repaint();
+        self.send(.{ .t = "menu_result", .id = id, .index = pick });
+        return true;
+    }
+
+    /// Ctrl+Enter: paste the clipboard (bracketed when CC asked for it)
+    /// and submit. Takes over CC's own Ctrl+Enter (chat:sendNow).
+    fn onCtrlEnter(self: *Keys) bool {
+        const text = readClipboard(self.allocator) orelse return true;
+        defer self.allocator.free(text);
+        // An ESC in the clipboard could end the paste early and inject keys.
+        const clean = std.mem.replaceOwned(u8, self.allocator, text, "\x1b", "") catch return true;
+        defer self.allocator.free(clean);
+        self.shared.mutex.lock();
+        const bracketed = self.shared.grid.term.modes.get(.bracketed_paste);
+        self.shared.mutex.unlock();
+        const payload = if (bracketed)
+            std.fmt.allocPrint(self.allocator, "\x1b[200~{s}\x1b[201~", .{clean}) catch return true
+        else
+            self.allocator.dupe(u8, clean) catch return true;
+        defer self.allocator.free(payload);
+        self.runner.write(payload) catch return true;
+        self.runner.push(.{ .settle = enter_gap_ms }) catch {};
+        self.runner.write("\r") catch {};
+        self.runner.push(.{ .settle = 250 }) catch {};
+        self.runner.push(.enter_if_text) catch {};
+        return true;
     }
 
     /// `./x` / `/~/x` + Tab: fzf on the real tty, then swap the token for
@@ -219,50 +391,48 @@ const Keys = struct {
         return true;
     }
 
-    /// Enter on a single-line `/~/path`: mkdir -p, /add-dir if outside the
-    /// allowed dirs, /clear, `! cd`, interrupt the turn CC starts after it.
-    /// /clear goes first because it resets CC's cwd to the start directory.
+    /// Enter on a single-line `/~/name`: create ~/claude/name, put a
+    /// command that opens cld-pi there on the clipboard, and say so in a
+    /// dialog. This session stays where it is.
     fn onEnter(self: *Keys) bool {
+        const a = self.allocator;
         var b = self.box() orelse return false;
-        defer b.deinit(self.allocator);
-        const target = (input.cdTarget(self.allocator, &b, self.home) catch null) orelse return false;
-        defer self.allocator.free(target);
+        defer b.deinit(a);
+        const target = (input.cdTarget(a, &b, self.home) catch null) orelse return false;
+        defer a.free(target);
         std.fs.cwd().makePath(target) catch return false;
-        self.queueCd(&b, target) catch {};
+        if (input.ctrlCPlan(a, &b) catch null) |clear| {
+            defer a.free(clear);
+            self.write(clear);
+        }
+        const cmd = input.launchCommand(a, target) catch return true;
+        defer a.free(cmd);
+        const copied = copyToClipboard(a, cmd);
+        self.showMessage(
+            target,
+            if (copied) "Launch command copied, paste it in a new terminal:" else "Run this in a new terminal (clipboard unavailable):",
+            cmd,
+        );
         return true;
     }
 
-    fn queueCd(self: *Keys, b: *const screen.Box, target: []const u8) !void {
+    /// A wrapper-owned dialog (id 0, no buttons: Enter / Esc close it).
+    fn showMessage(self: *Keys, title: []const u8, line1: []const u8, line2: []const u8) void {
         const a = self.allocator;
-        if (try input.ctrlCPlan(a, b)) |clear| {
-            defer a.free(clear);
-            try self.runner.write(clear);
-            try self.runner.push(.{ .settle = 80 });
-        }
-        if (!input.isAllowed(target, self.allowed.items)) {
-            const cmd = try std.fmt.allocPrint(a, "/add-dir {s}", .{target});
-            defer a.free(cmd);
-            try self.submit(cmd);
-            try self.runner.push(.{ .settle = 300 });
-            try self.runner.push(.{ .confirm_if = "Yes, for this session" });
-            try self.runner.push(.idle);
-            try self.allowed.append(a, try a.dupe(u8, target));
-        }
-        try self.submit("/clear");
-        try self.runner.push(.idle);
-        try self.runner.write("!");
-        try self.runner.push(.{ .settle = 150 });
-        const q = try input.shellQuote(a, target);
-        defer a.free(q);
-        // Trailing space: no path token under the caret, so CC's path
-        // suggestions don't pop up and take the Enter.
-        const cd = try std.fmt.allocPrint(a, "cd {s} ", .{q});
-        defer a.free(cd);
-        try self.submit(cd);
-        try self.runner.push(.interrupt);
-        // Esc can hand the command back to the box; don't leave it there.
-        try self.runner.push(.clear_box);
-        self.setCwd(target);
+        const t = a.dupe(u8, title) catch return;
+        const body = std.fmt.allocPrint(a, "{s}\n{s}", .{ line1, line2 }) catch {
+            a.free(t);
+            return;
+        };
+        const footer = a.dupe(u8, "enter / esc to close") catch {
+            a.free(t);
+            a.free(body);
+            return;
+        };
+        self.shared.mutex.lock();
+        defer self.shared.mutex.unlock();
+        self.shared.overlay.openDialog(.{ .id = 0, .title = t, .body = body, .footer = footer, .buttons = &.{} });
+        self.shared.repaint();
     }
 
     /// Type `text` + Enter as one write, after a quiet gap. Text and Enter
@@ -331,35 +501,178 @@ const Keys = struct {
 
 };
 
+fn copyToClipboard(allocator: std.mem.Allocator, text: []const u8) bool {
+    const argv = [_][]const u8{ "/bin/sh", "-c", "wl-copy 2>/dev/null || xclip -selection clipboard -i 2>/dev/null || pbcopy 2>/dev/null" };
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return false;
+    child.stdin.?.writeAll(text) catch {};
+    child.stdin.?.close();
+    child.stdin = null;
+    const res = child.wait() catch return false;
+    return res == .Exited and res.Exited == 0;
+}
+
+fn readClipboard(allocator: std.mem.Allocator) ?[]u8 {
+    const res = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "/bin/sh", "-c", "wl-paste --no-newline 2>/dev/null || xclip -o -selection clipboard 2>/dev/null || pbpaste 2>/dev/null" },
+        .max_output_bytes = 16 * 1024 * 1024,
+    }) catch return null;
+    allocator.free(res.stderr);
+    if (res.stdout.len == 0) {
+        allocator.free(res.stdout);
+        return null;
+    }
+    return res.stdout;
+}
+
 /// Messages from the sidecar:
 ///   {"t":"submit","data":s}  pi`s`: replace the box text with s + Enter
 ///   {"t":"buffer","data":s}  pi.BUFFER = s: replace the input box text
 ///   {"t":"write","data":s}   raw bytes to the pty
 ///   {"t":"arg","key":k,"value":v}  pi.arg.k = v (k: fzf)
+///   {"t":"dialog","id","title","body","footer","buttons":[..],"modal","vertical"}
+///        pi.dialog; modal:false (timeout set) is drawn top-right and leaves
+///        the keyboard to CC
+///   {"t":"dialog_update","id","index","label"}  a button callback returned a string
+///   {"t":"dialog_close","id"}
+///   {"t":"badge","text":s|null}  top-right label; clicks come back as badge_click
+///   {"t":"menu","id","items":[..]}  pi.menu
+///   {"t":"paint","rows":[[row, text], ..]}  pi.sed results ("" blanks)
+///   {"t":"subscribe","scr":bool}
 fn onSidecarLine(keys: *Keys, line: []const u8) void {
-    const Msg = struct { t: []const u8, data: ?[]const u8 = null, key: ?[]const u8 = null, value: ?[]const u8 = null };
-    const parsed = std.json.parseFromSlice(Msg, keys.allocator, line, .{ .ignore_unknown_fields = true }) catch return;
+    const a = keys.allocator;
+    const parsed = std.json.parseFromSlice(std.json.Value, a, line, .{}) catch return;
     defer parsed.deinit();
-    const m = parsed.value;
+    if (parsed.value != .object) return;
+    const m = parsed.value.object;
+    const t = str(m, "t") orelse return;
     const eql = std.mem.eql;
-    if (eql(u8, m.t, "write")) {
-        if (m.data) |d| keys.write(d);
-    } else if (eql(u8, m.t, "submit")) {
+    const sh = keys.shared;
+    if (eql(u8, t, "write")) {
+        if (str(m, "data")) |d| keys.write(d);
+    } else if (eql(u8, t, "submit")) {
         // Replace whatever draft is in the box, then Enter: appending a
         // command to a draft would send the mix as a prompt.
-        if (m.data) |d| {
+        if (str(m, "data")) |d| {
             keys.runner.push(.clear_box) catch {};
             keys.submit(d) catch {};
         }
-    } else if (eql(u8, m.t, "buffer")) {
-        if (m.data) |d| {
+    } else if (eql(u8, t, "buffer")) {
+        if (str(m, "data")) |d| {
             keys.runner.push(.clear_box) catch {};
             keys.runner.write(d) catch {};
         }
-    } else if (eql(u8, m.t, "arg")) {
-        const k = m.key orelse return;
-        if (eql(u8, k, "fzf")) keys.setFzfArgs(m.value orelse "");
+    } else if (eql(u8, t, "arg")) {
+        const k = str(m, "key") orelse return;
+        if (eql(u8, k, "fzf")) keys.setFzfArgs(str(m, "value") orelse "");
+    } else if (eql(u8, t, "dialog")) {
+        const d = buildDialog(a, m) catch return;
+        const modal = if (m.get("modal")) |v| !(v == .bool and !v.bool) else true;
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        if (modal) sh.overlay.openDialog(d) else sh.overlay.openToast(d);
+        sh.repaint();
+    } else if (eql(u8, t, "badge")) {
+        const text = if (str(m, "text")) |v| a.dupe(u8, v) catch return else null;
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        sh.overlay.setBadge(text);
+        sh.repaint();
+    } else if (eql(u8, t, "dialog_update")) {
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        const d = sh.overlay.findDialog(int(m, "id") orelse return) orelse return;
+        const i = int(m, "index") orelse return;
+        if (i >= d.buttons.len) return;
+        const label = a.dupe(u8, str(m, "label") orelse return) catch return;
+        a.free(d.buttons[i]);
+        d.buttons[i] = label;
+        sh.repaint();
+    } else if (eql(u8, t, "dialog_close")) {
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        sh.overlay.closeById(int(m, "id") orelse return);
+        sh.repaint();
+    } else if (eql(u8, t, "menu")) {
+        const items = strList(a, m.get("items") orelse return) catch return;
+        if (items.len == 0) {
+            a.free(items);
+            keys.send(.{ .t = "menu_result", .id = int(m, "id") orelse 0, .index = @as(?usize, null) });
+            return;
+        }
+        // Anchor: right above the input box, at the caret's column.
+        var bottom: u16 = 0;
+        var col: u16 = 0;
+        if (keys.box()) |b0| {
+            var b = b0;
+            bottom = b.top;
+            b.deinit(a);
+        }
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        if (bottom == 0) bottom = sh.grid.term.rows -| 1;
+        col = sh.grid.term.screens.active.cursor.x;
+        sh.overlay.openMenu(.{ .id = @intCast(int(m, "id") orelse 0), .items = items, .bottom = bottom, .col = col });
+        sh.paintOverlay();
+    } else if (eql(u8, t, "paint")) {
+        const rows = (m.get("rows") orelse return);
+        if (rows != .array) return;
+        var idx: std.ArrayList(u16) = .{};
+        defer idx.deinit(a);
+        var texts: std.ArrayList([]u8) = .{};
+        defer texts.deinit(a);
+        for (rows.array.items) |r| {
+            if (r != .array or r.array.items.len != 2 or r.array.items[0] != .integer or r.array.items[1] != .string) continue;
+            const text = a.dupe(u8, r.array.items[1].string) catch continue;
+            idx.append(a, @intCast(r.array.items[0].integer)) catch continue;
+            texts.append(a, text) catch continue;
+        }
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        sh.overlay.setPaints(idx.items, texts.items) catch return;
+        sh.repaint();
+    } else if (eql(u8, t, "subscribe")) {
+        if (m.get("scr")) |v| keys.scr_subscribed = v == .bool and v.bool;
+        // Dump right away instead of waiting for CC to draw something.
+        sh.dirty.store(true, .seq_cst);
     }
+}
+
+fn str(m: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = m.get(key) orelse return null;
+    return if (v == .string) v.string else null;
+}
+
+fn int(m: std.json.ObjectMap, key: []const u8) ?usize {
+    const v = m.get(key) orelse return null;
+    return if (v == .integer and v.integer >= 0) @intCast(v.integer) else null;
+}
+
+fn strList(a: std.mem.Allocator, v: std.json.Value) ![][]u8 {
+    if (v != .array) return error.NotArray;
+    var out: std.ArrayList([]u8) = .{};
+    errdefer {
+        for (out.items) |x| a.free(x);
+        out.deinit(a);
+    }
+    for (v.array.items) |x| if (x == .string) try out.append(a, try a.dupe(u8, x.string));
+    return out.toOwnedSlice(a);
+}
+
+fn buildDialog(a: std.mem.Allocator, m: std.json.ObjectMap) !overlay_mod.Dialog {
+    const title = try a.dupe(u8, str(m, "title") orelse "");
+    errdefer a.free(title);
+    const body = try a.dupe(u8, str(m, "body") orelse "");
+    errdefer a.free(body);
+    const footer = try a.dupe(u8, str(m, "footer") orelse "");
+    errdefer a.free(footer);
+    const buttons = try strList(a, m.get("buttons") orelse .{ .array = .init(a) });
+    const vertical = if (m.get("vertical")) |v| v == .bool and v.bool else false;
+    return .{ .id = @intCast(int(m, "id") orelse 0), .title = title, .body = body, .footer = footer, .buttons = buttons, .vertical = vertical };
 }
 
 /// Whether `argv` asks for interactive mode: no arguments, or only the
@@ -439,7 +752,8 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
 
     const grid = try Grid.create(allocator, sz.cols, sz.rows);
     defer grid.destroy(allocator);
-    var shared: Shared = .{ .allocator = allocator, .grid = grid };
+    var shared: Shared = .{ .allocator = allocator, .grid = grid, .overlay = .{ .allocator = allocator } };
+    defer shared.overlay.deinit();
 
     const orig_termios = try term.enterRaw(stdin_fd);
     defer term.restore(stdin_fd, orig_termios);
@@ -479,10 +793,14 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
 
     var keys = try Keys.init(allocator, &shared, session);
     defer keys.deinit();
+    if (side) |*s| keys.side = s;
 
     var fifo_buf: std.ArrayList(u8) = .{};
     defer fifo_buf.deinit(allocator);
     var last_scr_ns: i64 = 0;
+    // When the last key we forwarded to CC was Ctrl+C (else null). If CC
+    // exits right after, the user quit with Ctrl+C: drop the conversation.
+    var ctrl_c_ns: ?i64 = null;
     var inbuf: [4096]u8 = undefined;
 
     while (!shared.exited.load(.seq_cst)) {
@@ -507,7 +825,14 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
         if (fds[0].revents & (posix.POLL.IN | posix.POLL.HUP) != 0) {
             const n = posix.read(stdin_fd, &inbuf) catch 0;
             if (n == 0) break;
-            if (!keys.handle(inbuf[0..n])) session.writeInput(inbuf[0..n]) catch {};
+            if (!keys.handle(inbuf[0..n])) {
+                session.writeInput(inbuf[0..n]) catch {};
+                switch (input.decode(inbuf[0..n])) {
+                    .ctrl_c => ctrl_c_ns = @intCast(std.time.nanoTimestamp()),
+                    .focus_in, .focus_out => {},
+                    else => ctrl_c_ns = null,
+                }
+            }
         }
 
         if (fds[1].revents & posix.POLL.IN != 0) {
@@ -538,6 +863,10 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
                         defer allocator.free(c);
                         keys.setCwd(c);
                     }
+                    if (hook.extractTranscriptPath(allocator, ln.payload) catch null) |t| {
+                        defer allocator.free(t);
+                        keys.setTranscript(t);
+                    }
                 }
                 const rest = fifo_buf.items.len - (nl + 1);
                 std.mem.copyForwards(u8, fifo_buf.items[0..rest], fifo_buf.items[nl + 1 ..]);
@@ -553,10 +882,10 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
         keys.runner.tick(&keys, @divTrunc(now, std.time.ns_per_ms));
         if (shared.dirty.load(.seq_cst) and now - last_scr_ns >= scr_interval_ns) {
             last_scr_ns = now;
-            writeScr(&shared, scr_path);
+            writeScr(&shared, scr_path, &keys);
         }
     }
-    if (shared.dirty.load(.seq_cst)) writeScr(&shared, scr_path);
+    if (shared.dirty.load(.seq_cst)) writeScr(&shared, scr_path, &keys);
 
     // If CC died without leaving the alt screen, don't strand the user there.
     shared.mutex.lock();
@@ -566,6 +895,18 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
     term.writeAll(stdout_fd, "\x1b[?25h");
     term.restore(stdin_fd, orig_termios);
 
+    const quit_by_ctrl_c = if (ctrl_c_ns) |t|
+        @as(i64, @intCast(std.time.nanoTimestamp())) - t < ctrl_c_exit_window_ns
+    else
+        false;
+    if (quit_by_ctrl_c) if (keys.transcript) |t| {
+        if (convo.delete(t)) {
+            term.writeAll(1, "claude-p: quit with Ctrl+C, conversation deleted: ");
+            term.writeAll(1, t);
+            term.writeAll(1, "\n");
+        }
+    };
+
     if (first_run) {
         term.writeAll(1, rc_hint);
         if (std.fs.cwd().createFile(installed_path, .{})) |f| f.close() else |_| {}
@@ -573,15 +914,18 @@ pub fn run(allocator: std.mem.Allocator, extra: []const []const u8) !u8 {
     return shared.exit_code.load(.seq_cst);
 }
 
-fn writeScr(shared: *Shared, scr_path: []const u8) void {
+/// Dump the grid to `scr`, and to the sidecar when it subscribed.
+fn writeScr(shared: *Shared, scr_path: []const u8, keys: *Keys) void {
     shared.mutex.lock();
     shared.dirty.store(false, .seq_cst);
     const text = shared.grid.snapshot(shared.allocator) catch {
         shared.mutex.unlock();
         return;
     };
+    const cur = shared.grid.term.screens.active.cursor;
     shared.mutex.unlock();
     defer shared.allocator.free(text);
+    if (keys.scr_subscribed) sendScr(keys, text, cur.y, cur.x);
     // Write-then-rename so readers never see a half-written frame.
     var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{scr_path}) catch return;
@@ -589,6 +933,15 @@ fn writeScr(shared: *Shared, scr_path: []const u8) void {
     f.writeAll(text) catch {};
     f.close();
     std.fs.cwd().rename(tmp, scr_path) catch {};
+}
+
+fn sendScr(keys: *Keys, text: []const u8, row: usize, col: usize) void {
+    const a = keys.allocator;
+    var rows: std.ArrayList([]const u8) = .{};
+    defer rows.deinit(a);
+    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, text, "\n"), '\n');
+    while (it.next()) |r| rows.append(a, r) catch return;
+    keys.send(.{ .t = "scr", .rows = rows.items, .cursor = .{ .row = row, .col = col } });
 }
 
 test "wantsInteractive" {
@@ -609,4 +962,6 @@ test {
     std.testing.refAllDecls(@import("screen.zig"));
     std.testing.refAllDecls(@import("input.zig"));
     std.testing.refAllDecls(@import("steps.zig"));
+    std.testing.refAllDecls(@import("overlay.zig"));
+    std.testing.refAllDecls(convo);
 }

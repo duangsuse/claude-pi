@@ -10,6 +10,7 @@ interface Events {
   notification(payload: { message: string }): void
   sessionStart(payload: { session_id: string; cwd: string }): void
   user(msg: string): void          // 用户提交了一条消息（P6）
+  focus(focused: boolean): void    // 终端焦点变化（来自 CSI I / CSI O）
   scrcpy(s: Scr): void             // 每帧触发
   CtrlC(): void | false            // 返回 false 表示不再走默认行为
   [key: `Ctrl${string}` | `Shift${string}`]: (() => void | false) | undefined
@@ -30,6 +31,8 @@ type Button = (row1: string) => string | void
  * gum 风格的多行 dialog。
  * 除 title/body/footer 外，其余键都是按钮：键名是按钮文字，值是 Button。
  * 没有硬编码的 OK，`OK` 只是一个叫 OK 的普通按钮。
+ * ←/→/Tab 切换按钮，Enter 按下，Esc 关闭。按钮返回字符串：改按钮文字、dialog 保持打开；
+ * 返回其他值：关闭 dialog。row1 目前是 body 的第一行。
  */
 type Dialog = {
   title?: string
@@ -64,15 +67,21 @@ interface Pi {
   /** 注册前缀补全：返回候选列表，由 Zig 侧交给 fzf */
   complete(prefix: string, source: (tok: string) => Promise<string[]> | string[]): void
   on: On
-  dialog(d: Dialog): Promise<void>
+  /** resolve 为按下的按钮文字；Esc 关闭时为 null */
+  dialog(d: Dialog): Promise<string | null>
+  /** 输入框上方的下拉菜单，↑/↓ 选择、Enter 确认；resolve 为选中项，Esc 为 null */
+  menu(items: string[]): Promise<string | null>
   /**
    * 鼠标点击网格某一行时回调，i_row 是屏幕行号（0 起）。
    * 点在输入框箭头（❯）那一行及其下方的不算：输入框、状态栏的点击照常交给 CC。
    */
   click(handler: (i_row: number) => void): () => void
-  notify(msg: string): void        // notify-send
+  notify(msg: string): void        // notify-send（macOS 用 osascript）
+  /** 最近一帧网格；只有调用过 pi.sed 或订阅后才会每帧更新 */
+  state: { cols: number; rows: number; focused?: boolean; scr: Scr | null }
 
-  // P2：逐行处理网格。返回字符串就把这一行涂成该文本，返回 null 就涂掉。不改写 CC 的输出字节流
+  // P2：逐行处理网格。返回字符串就把这一行涂成该文本（'' 即涂掉）；返回 null 表示不改这一行
+  //（用来优化：跳过该行，不是涂掉）。多个 sed 按注册顺序串联。不改写 CC 的输出字节流
   sed(fn: (ln: string) => string | null): void
 
   // P6：消息边界和 scrollInView
@@ -101,7 +110,7 @@ export default (pi: Pi) => {
   pi.notify('done')
 
   // P2
-  pi.sed(ln => ln || null)
+  pi.sed(ln => ln.includes('secret') ? '' : null)
 
   // P6
   pi.mark('last')

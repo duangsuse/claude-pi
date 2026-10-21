@@ -41,10 +41,19 @@ pub const Grid = struct {
     /// synchronized output so it lands as one frame. No palette: that's the
     /// user's terminal's business.
     pub fn redraw(self: *Grid, allocator: std.mem.Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(allocator);
-        errdefer out.deinit();
-        const w = &out.writer;
-        try w.writeAll("\x1b[?2026h");
+        var out: std.ArrayList(u8) = .{};
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, "\x1b[?2026h");
+        try self.redrawInto(allocator, &out);
+        try out.appendSlice(allocator, "\x1b[?2026l");
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// `redraw` without the synchronized-output wrapper, appended to `out`.
+    pub fn redrawInto(self: *Grid, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, out);
+        defer out.* = aw.toArrayList();
+        const w = &aw.writer;
         if (self.onAltScreen()) try w.writeAll("\x1b[?1049h");
         try w.writeAll("\x1b[0m\x1b[H\x1b[2J");
         var f: vt.formatter.TerminalFormatter = .init(&self.term, .{ .emit = .vt, .trim = false });
@@ -59,8 +68,22 @@ pub const Grid = struct {
         // tmux ignores the set form, and CC pops its entry on exit anyway.
         const kitty = self.term.screens.active.kitty_keyboard.current().int();
         if (kitty != 0) try w.print("\x1b[>{d}u", .{kitty});
-        try w.writeAll("\x1b[?2026l");
-        return out.toOwnedSlice();
+    }
+
+    /// After painting over the screen: put the cursor position, SGR and
+    /// cursor visibility back to what CC left (CC itself uses DECSC/DECRC,
+    /// so we can't borrow them).
+    pub fn restoreCursor(self: *Grid, allocator: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, out);
+        defer out.* = aw.toArrayList();
+        var f: vt.formatter.ScreenFormatter = .init(self.term.screens.active, .{ .emit = .vt });
+        f.content = .none;
+        f.extra = .none;
+        f.extra.cursor = true;
+        f.extra.style = true;
+        try aw.writer.writeAll("\x1b[0m");
+        try aw.writer.print("{f}", .{f});
+        try aw.writer.writeAll(if (self.term.modes.get(.cursor_visible)) "\x1b[?25h" else "\x1b[?25l");
     }
 
     /// Plain-text viewport, exactly `rows` lines (line N == screen row N).
@@ -151,4 +174,23 @@ test "redraw restores kitty keyboard flags and modifyOtherKeys" {
     b.feed(bytes);
     try testing.expectEqual(@as(u5, 5), b.term.screens.active.kitty_keyboard.current().int());
     try testing.expect(b.term.flags.modify_other_keys_2);
+}
+
+test "restoreCursor puts cursor and SGR back after a paint" {
+    const a = try Grid.create(testing.allocator, 20, 5);
+    defer a.destroy(testing.allocator);
+    a.feed("\x1b[3;7H\x1b[1;31m");
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(testing.allocator);
+    try out.appendSlice(testing.allocator, "\x1b[1;1H\x1b[0;44mpaint");
+    try a.restoreCursor(testing.allocator, &out);
+
+    const b = try Grid.create(testing.allocator, 20, 5);
+    defer b.destroy(testing.allocator);
+    b.feed(out.items);
+    try testing.expectEqual(@as(u16, 6), b.term.screens.active.cursor.x);
+    try testing.expectEqual(@as(u16, 2), b.term.screens.active.cursor.y);
+    const st = b.term.screens.active.cursor.style;
+    try testing.expect(st.flags.bold);
+    try testing.expect(st.bg_color == .none);
 }

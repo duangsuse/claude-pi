@@ -44,9 +44,10 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
 | fzf 参数 | `pi.arg.fzf` 可调，默认 `--pointer '▶' --bind 'ctrl-d:become(dirname -- {})'`（ctrl-d 选中当前项所在文件夹） |
 | `//` + Tab | 打开 fzf 选 Chrome 标签页（按域名或标题），选中后截图，插入 `@/tmp/…png` |
 | `//gh/` + Tab | 按站点前缀补全 URL，来源是标签页列表和历史 |
-| 单行输入且以 `/~/` 开头时按回车 | 拦截 Enter：wrapper 自己 `mkdir -p ~/X`；路径在允许目录之外时先 `/add-dir`（自动选 "Yes, for this session"）；然后 `/clear`，再 `! cd X`，并 Esc 掉 CC 在 `!` 命令后自动开始的那一轮。`/clear` 必须在 cd 之前：它会把 CC 的 cwd 重置回启动目录 |
+| 单行输入且以 `/~/` 开头时按回车 | 拦截 Enter：`mkdir -p ~/claude/X`（`/~/wtf` → `~/claude/wtf`），把 `cd '~/claude/X' && npx cld-pi` 复制到剪贴板（`wl-copy`，回退 `xclip` / `pbcopy`），dialog 提示到新终端粘贴。当前会话不切目录、不 `/clear` |
+| Ctrl+C 退出 CC | 转发给 CC 的最后一个键是 Ctrl+C 且 CC 随即退出（3 秒内）时，删除该会话在 `~/.claude/projects/` 下的对话（`<session>.jsonl` 和同名目录），退出后打印删除的路径 |
 | Ctrl+C | 输入框为空时透传给 CC（打断或退出）；不为空时只清掉**光标所在行及下方**的输入行，保留前面的换行，光标停在新的空行上 |
-| Ctrl+Enter | 读剪贴板（`wl-paste`），用 bracketed paste 注入后回车执行（`CSI 13;5u`） |
+| Ctrl+Enter | 读剪贴板（`wl-paste`，回退 `xclip` / `pbpaste`），用 bracketed paste 注入后回车执行。需要终端发出 `CSI 13;5u`（kitty 协议）或 `CSI 27;5;13~`（modifyOtherKeys），否则和 Enter 无法区分 |
 | Ctrl+P | 打开设置面板 |
 
 ### Ctrl+P 面板（gum 风格居中 dialog）
@@ -83,7 +84,7 @@ claude-p (Zig) ── 0 参数 → src/pi/  交互模式
 
 ### 事件
 - 用 `--settings` 内联注入 Notification、Stop、SessionStart hook，沿用原项目的 FIFO 机制。
-- Notification 和 Stop 事件 → `notify-send`；事件同时转发给插件的 `pi.on`。
+- Notification 和 Stop 事件 → `notify-send`；事件同时转发给插件的 `pi.on`。由默认插件 `js/plugins/notify.js` 实现：终端有焦点时（CC 打开了焦点上报 `?1004`）不弹。
 
 ### 首次运行
 检测到 `~/claude/-p/.installed` 不存在时，打印一条命令让用户自己执行（只打印，不自动修改 rc）：
@@ -99,7 +100,7 @@ echo 'claude-p-w(){ BUFFER=claude-p; zle accept-line }; zle -N claude-p-w; bindk
 |---|---|---|---|---|
 | **P0 底座** ✅ | fork；0 参数进入 `src/pi/`；raw 模式双向透传；SIGWINCH；ghostty-vt；每帧写 `scr`；强制 fullscreen；首次运行打印 rc 命令；node sidecar 和 RPC 骨架；打包流程加入 `js/` | 450 | 120 | `claude-p` 打开后和直接运行 `claude` 体验一致，`scr` 内容和屏幕一致 |
 | **P1 输入核心** ✅ 待手测 | 识别输入框（边框、占位符的灰色 SGR）；Ctrl+C 两种语义；Tab 前缀路由，fzf 在真实 tty 运行后按网格重绘；`./`、`/~/` 补全插入 `@`；只输路径时回车 cd，不存在则新建，之后 `/clear` | 400 | 120 | 补全、清行、cd 三个场景各手测 10 次无错乱 |
-| **P2 叠加层和按键** | gum 风格的下拉菜单、dialog、涂抹层（同步输出，CC 每帧画完后重新涂）；kitty 键盘协议；Ctrl+Enter 粘贴执行；hook 事件接 notify-send | 500 | 60 | CC 正在流式输出时打开 dialog 不闪烁，关闭后画面完全恢复 |
+| **P2 叠加层和按键** ✅ 待手测 | gum 风格的下拉菜单、dialog、涂抹层（同步输出，CC 每帧画完后重新涂）；kitty 键盘协议；Ctrl+Enter 粘贴执行；hook 事件接 notify-send | 500 | 60 | CC 正在流式输出时打开 dialog 不闪烁，关闭后画面完全恢复 |
 | **P3 插件系统和默认插件** | 插件 API；加载 `~/claude/-p/*.js`；`/m`、`/w`、`/ad` | 150 | 350 | 写一个用户插件能自动加载，3 个默认命令都能用 |
 | **P4 Ctrl+P 面板** | 按钮；session 名和花费；bash 输出涂抹开关；基于 pi.dialog({}) 的面板 | 350 | 250 | 每个控件都和 CC 实际状态同步（改完后从状态栏读回来核对） |
 | **P5 浏览器** | 预检查；`//` 选标签页截图；`//gh/` 补全；维护 `~/.F12-mcp.json`；提示 MCP 安装命令 | 50 | 350 | 能选中标签页截图并插入 `@png`，Claude 能读到 |

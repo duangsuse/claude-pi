@@ -1,10 +1,12 @@
 // node sidecar spawned by `claude-p` in interactive mode. Speaks JSON lines
 // on stdio (see src/pi/sidecar.zig). stderr is discarded by the binary, so
 // everything diagnostic goes to ~/claude/-p/host.log.
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { appendFileSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import inspector from 'node:inspector'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { createHost, lineSplitter } from './rpc.js'
 
 const dataDir = process.env.CLAUDE_P_DIR || join(homedir(), 'claude', '-p')
@@ -17,8 +19,22 @@ const log = (...a) => {
   } catch {}
 }
 
+// Desktop notification; best effort (notify-send on Linux, osascript on macOS).
+const notify = msg => {
+  const [cmd, args] =
+    process.platform === 'darwin'
+      ? ['osascript', ['-e', `display notification ${JSON.stringify(msg)} with title "Claude Code"`]]
+      : ['notify-send', ['-a', 'Claude Code', 'Claude Code', msg]]
+  const p = spawn(cmd, args, { stdio: 'ignore', detached: true })
+  p.on('error', e => log('notify failed', e.message))
+  p.unref()
+}
+
 const send = msg => process.stdout.write(JSON.stringify(msg) + '\n')
-const { pi, dispatch } = createHost(send, log)
+const host = createHost(send, log, { notify })
+const { pi, dispatch } = host
+// Timers plugins create are charged to them (cleared when turned off).
+host.installTimerHooks()
 
 // Debugging is on by default: open chrome://inspect (F12) and poke the global
 // `pi`, e.g. pi`hello`. Listens on 127.0.0.1 only; 9229 is what chrome://inspect
@@ -51,6 +67,28 @@ pi.on({
   init: m => log('init', { cols: m.cols, rows: m.rows, pid: m.pid }),
   sessionStart: p => log('sessionStart', p?.session_id),
 })
+
+// Default plugins shipped in js/plugins/, then the user's ~/claude/-p/*.js
+// (listed as ~/name.js). Each can be turned off from the badge's list.
+const loadDir = async (dir, prefix) => {
+  let files = []
+  try {
+    // .js relies on Node's ESM syntax detection (22.12+); .mjs works everywhere.
+    files = readdirSync(dir).filter(f => /\.m?js$/.test(f)).sort()
+  } catch {}
+  for (const f of files) {
+    try {
+      const mod = await import(pathToFileURL(join(dir, f)).href)
+      if (typeof mod.default !== 'function') throw new Error('no default export function')
+      await host.loadPlugin(prefix + f, mod.default)
+      log('plugin', prefix + f)
+    } catch (e) {
+      log(`plugin ${prefix + f} failed`, e)
+    }
+  }
+}
+await loadDir(join(import.meta.dirname, 'plugins'), '')
+await loadDir(dataDir, '~/')
 
 process.stdin.setEncoding('utf8')
 process.stdin.on(

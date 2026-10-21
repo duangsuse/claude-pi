@@ -30,7 +30,8 @@ Requires `claude` on `$PATH`, Node ≥ 18, macOS or Linux.
 shell to `claude-p`. Nothing is written to your rc files for you.
 
 Interactive mode forces `/tui fullscreen` and registers `Notification`,
-`Stop` and `SessionStart` hooks through `--settings`. It keeps its files in
+`Stop` and `SessionStart` hooks through `--settings`; Stop / Notification
+pop a desktop notification (`notify-send`) when the terminal isn't focused. It keeps its files in
 `~/claude/-p/`:
 
 | File | What |
@@ -47,7 +48,10 @@ Interactive mode forces `/tui fullscreen` and registers `Notification`,
 | `./…` + Tab | fzf over files in CC's current dir → inserts `@path ` (ctrl-d: the file's folder) |
 | `/~/…` + Tab | same, under `~` |
 | Ctrl+C | clears the caret's line and the lines below, caret stays on a fresh line; empty box → Claude Code's own Ctrl+C |
-| Enter on a single line `/~/dir` | creates `~/dir` if needed, `/add-dir` if outside, `/clear`, then `! cd` there |
+| Ctrl+Enter | paste the clipboard and submit (needs a kitty-protocol or modifyOtherKeys terminal) |
+| quitting with Ctrl+C | **deletes that conversation** from `~/.claude/projects/` (quit with `/exit` to keep it) |
+| Ctrl+Enter | paste the clipboard and submit (needs a kitty-protocol or modifyOtherKeys terminal) |
+| Enter on a single line `/~/name` | creates `~/claude/name` and copies `cd … && npx cld-pi` to paste in a new terminal |
 
 ## Debugging plugins (F12)
 
@@ -58,13 +62,17 @@ The node sidecar runs with the inspector on by default, listening on
 ```js
 pi`/help`            // type a line into Claude Code + Enter
 pi.BUFFER = 'draft'  // replace the input box text, no Enter (write-only)
+pi.BUFFER=await pi.menu('abc'.split(''))
+
 pi.arg.fzf = "--pointer '▶' --height=60%"   // fzf options for Tab completion
+await pi.dialog({ title: 'Hi', body: 'gum-style', OK: () => {}, Stat: () => pi`/status` })
+pi.sed(ln => ln.includes('secret') ? '' : null)   // blank / rewrite screen rows
 await pi.on.stop      // wait for the next Stop hook
 ```
 
-`CLAUDE_P_INSPECT=0` turns it off, `CLAUDE_P_INSPECT=<port>` picks a port.
-Anything on your machine that can reach that local port can run code as
-you, so turn it off on shared hosts.
+`CLAUDE_P_INSPECT=9223` picks another port. (0=OFF).
+
+> [Refer this](./goal-v1.ts) for more
 
 ## Roadmap
 
@@ -72,7 +80,7 @@ you, so turn it off on shared hosts.
 |---|---|---|
 | P0 | Passthrough, ghostty-vt grid, `scr`, hooks, node sidecar | ✅ done |
 | P1 | Input box detection, `./` `/~/` completion, Ctrl+C, path → `cd` | ✅ done |
-| P2 | Overlays (menu / dialog / paint), Ctrl+Enter, `notify-send` | |
+| P2 | Overlays (menu / dialog / paint), Ctrl+Enter, `notify-send` | ✅ done |
 | P3 | Plugin API, `/m` `/w` `/ad` | |
 | P4 | Ctrl+P settings panel | |
 | P5 | Chrome tabs: `//` screenshot, `//gh/` URLs, WebMCP | |

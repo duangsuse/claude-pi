@@ -3,18 +3,124 @@
 const std = @import("std");
 const screen = @import("screen.zig");
 
-pub const Key = enum { tab, enter, ctrl_c, other };
+pub const Key = union(enum) {
+    tab,
+    shift_tab,
+    enter,
+    ctrl_enter,
+    ctrl_c,
+    esc,
+    up,
+    down,
+    left,
+    right,
+    backspace,
+    focus_in,
+    focus_out,
+    char: u21,
+    /// SGR mouse report (CC turns on ?1006). x/y are 0-based cells.
+    mouse: Mouse,
+    other,
+};
 
-/// Only chunks that are exactly one of these keys are intercepted; typing
-/// arrives a key per read, pastes arrive bracketed, so anything bigger is
-/// passed through untouched. Both legacy bytes and kitty CSI-u forms (CC
-/// turns the kitty protocol on when the terminal supports it).
-pub fn classify(bytes: []const u8) Key {
+pub const Mouse = struct { button: u16, x: u16, y: u16, press: bool };
+
+fn decodeMouse(bytes: []const u8) ?Mouse {
+    // ESC [ < b ; x ; y (M|m)
+    if (bytes.len < 9 or !std.mem.startsWith(u8, bytes, "\x1b[<")) return null;
+    const final = bytes[bytes.len - 1];
+    if (final != 'M' and final != 'm') return null;
+    var it = std.mem.splitScalar(u8, bytes[3 .. bytes.len - 1], ';');
+    const b = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    const x = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    const y = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    if (it.next() != null or x == 0 or y == 0) return null;
+    return .{ .button = b, .x = x - 1, .y = y - 1, .press = final == 'M' };
+}
+
+/// Decode a stdin chunk that is exactly one key. Typing arrives a key per
+/// read and pastes arrive bracketed, so anything else is `.other` and is
+/// passed through untouched. Understands legacy bytes, kitty CSI-u (CC turns
+/// the kitty protocol on when the terminal supports it) and xterm
+/// modifyOtherKeys (`CSI 27;mods;code ~`).
+pub fn decode(bytes: []const u8) Key {
     const eql = std.mem.eql;
-    if (eql(u8, bytes, "\t") or eql(u8, bytes, "\x1b[9u")) return .tab;
-    if (eql(u8, bytes, "\r") or eql(u8, bytes, "\x1b[13u")) return .enter;
-    if (eql(u8, bytes, "\x03") or eql(u8, bytes, "\x1b[99;5u") or eql(u8, bytes, "\x1b[99;5:1u")) return .ctrl_c;
-    return .other;
+    if (bytes.len == 0) return .other;
+    if (bytes.len == 1) return switch (bytes[0]) {
+        '\t' => .tab,
+        '\r' => .enter,
+        0x03 => .ctrl_c,
+        0x1b => .esc,
+        0x7f, 0x08 => .backspace,
+        0x20...0x7e => .{ .char = bytes[0] },
+        else => .other,
+    };
+    if (bytes[0] != 0x1b) {
+        // One UTF-8 character.
+        const n = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return .other;
+        if (n != bytes.len) return .other;
+        return .{ .char = std.unicode.utf8Decode(bytes) catch return .other };
+    }
+    const legacy = [_]struct { []const u8, Key }{
+        .{ "\x1b[A", .up },  .{ "\x1bOA", .up },  .{ "\x1b[B", .down }, .{ "\x1bOB", .down },
+        .{ "\x1b[C", .right }, .{ "\x1bOC", .right }, .{ "\x1b[D", .left }, .{ "\x1bOD", .left },
+        .{ "\x1b[Z", .shift_tab }, .{ "\x1b[I", .focus_in }, .{ "\x1b[O", .focus_out },
+    };
+    for (legacy) |e| if (eql(u8, bytes, e[0])) return e[1];
+    if (decodeMouse(bytes)) |m| return .{ .mouse = m };
+    if (bytes.len < 4 or bytes[1] != '[') return .other;
+
+    // CSI params final: `code;mods[:event]u`, `27;mods;code~`, `1;mods A`.
+    const final = bytes[bytes.len - 1];
+    var nums: [3]u32 = .{ 0, 1, 1 }; // code, mods, event
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, bytes[2 .. bytes.len - 1], ";");
+    var fields: [3][]const u8 = undefined;
+    while (it.next()) |f| : (n += 1) {
+        if (n == 3) return .other;
+        fields[n] = f;
+    }
+    if (n == 0) return .other;
+    for (fields[0..n], 0..) |f, i| {
+        var sub = std.mem.splitScalar(u8, f, ':');
+        nums[i] = std.fmt.parseInt(u32, sub.first(), 10) catch return .other;
+        if (i == 1) if (sub.next()) |ev| {
+            nums[2] = std.fmt.parseInt(u32, ev, 10) catch return .other;
+        };
+    }
+    var code: u32 = undefined;
+    var mods: u32 = undefined;
+    switch (final) {
+        'u' => {
+            code = nums[0];
+            mods = if (n > 1) nums[1] else 1;
+            if (nums[2] == 3) return .other; // key release
+        },
+        '~' => {
+            if (n != 3 or nums[0] != 27) return .other;
+            mods = nums[1];
+            code = nums[2];
+        },
+        'A', 'B', 'C', 'D' => return switch (final) {
+            'A' => .up,
+            'B' => .down,
+            'C' => .right,
+            else => .left,
+        },
+        else => return .other,
+    }
+    const m = mods -| 1; // bit 0 shift, 1 alt, 2 ctrl
+    const shift = m & 1 != 0;
+    const ctrl = m & 4 != 0;
+    if (m & ~@as(u32, 5) != 0) return .other; // alt / super / …
+    return switch (code) {
+        9 => if (shift) .shift_tab else .tab,
+        13 => if (ctrl) .ctrl_enter else if (m == 0) .enter else .other,
+        27 => .esc,
+        127 => .backspace,
+        'c' => if (ctrl) .ctrl_c else .{ .char = 'c' },
+        else => if (!ctrl and code >= 0x20 and code <= 0x10FFFF) .{ .char = @intCast(code) } else .other,
+    };
 }
 
 pub const left = "\x1b[D";
@@ -106,23 +212,21 @@ pub fn mention(allocator: std.mem.Allocator, mode: screen.Mode, abs: []const u8,
     };
 }
 
-/// Enter on a single-line `/~/path`: the directory `~/path` (Enter creates
-/// it). Same prefix as the `/~/` Tab completion. Anything else: null.
+/// Enter on a single-line `/~/name`: the project directory `~/claude/name`
+/// (Enter creates it and copies a launch command for it). Anything else: null.
 pub fn cdTarget(allocator: std.mem.Allocator, box: *const screen.Box, home: []const u8) !?[]u8 {
     if (box.empty or box.mode != .prompt or box.lines.len != 1) return null;
     const text = std.mem.trim(u8, box.lines[0], " ");
     if (!std.mem.startsWith(u8, text, "/~/")) return null;
     if (std.mem.indexOfAny(u8, text, " \t") != null) return null;
-    return try std.fs.path.resolve(allocator, &.{ home, text[3..] });
+    return try std.fs.path.resolve(allocator, &.{ home, "claude", text[3..] });
 }
 
-/// `dir` is inside one of `allowed` (or equal to it).
-pub fn isAllowed(dir: []const u8, allowed: []const []const u8) bool {
-    for (allowed) |a| {
-        if (std.mem.eql(u8, dir, a)) return true;
-        if (std.mem.startsWith(u8, dir, a) and dir.len > a.len and (a[a.len - 1] == '/' or dir[a.len] == '/')) return true;
-    }
-    return false;
+/// What to paste in a new terminal to open cld-pi in `dir`.
+pub fn launchCommand(allocator: std.mem.Allocator, dir: []const u8) ![]u8 {
+    const q = try shellQuote(allocator, dir);
+    defer allocator.free(q);
+    return std.fmt.allocPrint(allocator, "cd {s} && npx cld-pi", .{q});
 }
 
 /// Single-quote for a POSIX shell.
@@ -149,14 +253,34 @@ fn box1(text: []const u8, mode: screen.Mode) screen.Box {
     return .{ .top = 0, .bottom = 2, .mode = mode, .empty = false, .lines = &S.lines, .cursor = .{ .line = 0, .col = cpLen(text) } };
 }
 
-test "classify legacy and kitty forms" {
-    try testing.expectEqual(Key.tab, classify("\t"));
-    try testing.expectEqual(Key.tab, classify("\x1b[9u"));
-    try testing.expectEqual(Key.enter, classify("\r"));
-    try testing.expectEqual(Key.ctrl_c, classify("\x03"));
-    try testing.expectEqual(Key.ctrl_c, classify("\x1b[99;5u"));
-    try testing.expectEqual(Key.other, classify("a\t"));
-    try testing.expectEqual(Key.other, classify("\x1b[200~\t\x1b[201~"));
+test "decode legacy, kitty CSI-u and modifyOtherKeys" {
+    const t = testing;
+    try t.expectEqual(Key.tab, decode("\t"));
+    try t.expectEqual(Key.tab, decode("\x1b[9u"));
+    try t.expectEqual(Key.shift_tab, decode("\x1b[Z"));
+    try t.expectEqual(Key.shift_tab, decode("\x1b[9;2u"));
+    try t.expectEqual(Key.enter, decode("\r"));
+    try t.expectEqual(Key.enter, decode("\x1b[13u"));
+    try t.expectEqual(Key.ctrl_enter, decode("\x1b[13;5u"));
+    try t.expectEqual(Key.ctrl_enter, decode("\x1b[27;5;13~"));
+    try t.expectEqual(Key.ctrl_c, decode("\x03"));
+    try t.expectEqual(Key.ctrl_c, decode("\x1b[99;5u"));
+    try t.expectEqual(Key.ctrl_c, decode("\x1b[99;5:1u"));
+    try t.expectEqual(Key.other, decode("\x1b[99;5:3u"));
+    try t.expectEqual(Key.esc, decode("\x1b"));
+    try t.expectEqual(Key.esc, decode("\x1b[27u"));
+    try t.expectEqual(Key.up, decode("\x1b[A"));
+    try t.expectEqual(Key.down, decode("\x1b[1;5B"));
+    try t.expectEqual(Key.focus_out, decode("\x1b[O"));
+    try t.expectEqual(Key{ .char = 'x' }, decode("x"));
+    try t.expectEqual(Key{ .char = 0x4F60 }, decode("你"));
+    try t.expectEqual(Key{ .char = 'x' }, decode("\x1b[120u"));
+    try t.expectEqual(Key.other, decode("\x1b[13;3u")); // alt+enter
+    try t.expectEqual(Key.other, decode("a\t"));
+    try t.expectEqual(Key.other, decode("\x1b[200~\t\x1b[201~"));
+    try t.expectEqual(Key{ .mouse = .{ .button = 0, .x = 97, .y = 0, .press = true } }, decode("\x1b[<0;98;1M"));
+    try t.expectEqual(Key{ .mouse = .{ .button = 0, .x = 4, .y = 9, .press = false } }, decode("\x1b[<0;5;10m"));
+    try t.expectEqual(Key.other, decode("\x1b[<0;98;1M\x1b[<0;98;1m"));
 }
 
 test "ctrlCPlan: middle row of three" {
@@ -216,9 +340,10 @@ test "mention" {
 test "cdTarget: only single-line /~/" {
     const a = testing.allocator;
     const cases = .{
-        .{ "/~/proj/new", "/home/u/proj/new" },
-        .{ "/~/", "/home/u" },
-        .{ "/~/a/../b", "/home/u/b" },
+        .{ "/~/wtf", "/home/u/claude/wtf" },
+        .{ "/~/proj/new", "/home/u/claude/proj/new" },
+        .{ "/~/", "/home/u/claude" },
+        .{ "/~/a/../b", "/home/u/claude/b" },
     };
     inline for (cases) |c| {
         const b = box1(c[0], .prompt);
@@ -234,12 +359,10 @@ test "cdTarget: only single-line /~/" {
     try testing.expect((try cdTarget(a, &bash, "/home/u")) == null);
 }
 
-test "isAllowed" {
-    const allowed = [_][]const u8{ "/p/root", "/tmp/x" };
-    try testing.expect(isAllowed("/p/root", &allowed));
-    try testing.expect(isAllowed("/p/root/a/b", &allowed));
-    try testing.expect(!isAllowed("/p/rootish", &allowed));
-    try testing.expect(!isAllowed("/home", &allowed));
+test "launchCommand" {
+    const c = try launchCommand(testing.allocator, "/home/u/claude/it's");
+    defer testing.allocator.free(c);
+    try testing.expectEqualStrings("cd '/home/u/claude/it'\\''s' && npx cld-pi", c);
 }
 
 test "shellQuote" {

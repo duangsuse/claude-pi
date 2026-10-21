@@ -27,7 +27,9 @@ capturing the final assistant message via a `Stop` hook, and emitting it in
    byte-for-byte equal to `claude -p`'s output for the same prompt. Golden
    files live in `tests/fixtures/`. If you change a formatter, regenerate
    goldens with `zig build update-fixtures` and review the diff carefully.
-4. **No global state mutation.** Never write to `~/.claude/`. All hook
+4. **No global state mutation.** Never write to `~/.claude/` — with one
+   user-requested exception: in interactive mode, quitting CC with Ctrl+C
+   deletes that session's transcript (`src/pi/convo.zig`, path-checked). All hook
    scripts, settings, FIFOs live under `$TMPDIR/claude-p-<pid>/` and are
    cleaned up on exit (including via signal-safe cleanup paths).
 5. **Vendored zmux.** `zmux` is pulled in via `zig fetch` and the
@@ -72,6 +74,8 @@ runs the real `claude` binary.
 | `src/pi/input.zig` | Pure key logic: Tab prefixes, Ctrl+C plan, path → cd target. |
 | `src/pi/steps.zig` | Non-blocking queue of pty writes + waits (cd flow). |
 | `src/pi/fzf.zig` | fzf on the real tty (main.zig pauses output, repaints from grid). |
+| `src/pi/overlay.zig` | Dialog / menu / row paints, appended after every CC chunk. |
+| `js/plugins/*.js` | Default plugins loaded by host.js (notify on Stop/Notification). |
 | `src/pi/testdata/*.vt` | Raw CC output streams (100x30) replayed by screen/grid tests. |
 | `scripts/cc-probe.py` | Drive real CC through claude-p, record `.vt` + `scr` per step. |
 | `scripts/vt-view.mjs` | Page through `.vt` files (←/→) by replaying them. |
@@ -88,8 +92,8 @@ runs the real `claude` binary.
 - `cc-probe.py` has no terminal emulator in front of it: it can't show what
   the user actually sees (fzf panels, repaints). For that run claude-p in
   `tmux -L <own socket> new-session -x 100 -y 30 ...` and `capture-pane`.
-- Probes never submit a prompt unless a step does. Note `! cmd` and the cd
-  flow start a model turn (interrupted right away) — keep those runs few.
+- Probes never submit a prompt unless a step does. Note `! cmd` starts a
+  model turn after the command (Esc it) — keep those runs few.
 - New CC screen states → record with cc-probe, copy the `.vt` into
   `src/pi/testdata/` (scrub account details), add a `screen.zig` test.
 
@@ -103,8 +107,15 @@ runs the real `claude` binary.
   space so no suggestion pops up at all.
 - **CC is "busy" while a `!` command runs** (`⎿ Running…`). Esc then
   cancels the command and puts it back in the box.
-- **`/clear` resets CC's cwd** to the start dir, so the cd flow does
-  /clear first, then `! cd`.
+- **Overlays never use DECSC/DECRC** (CC uses them); the cursor and SGR
+  are put back from the grid (`Grid.restoreCursor`). Each CC chunk + the
+  overlay go out in one `?2026` synchronized write.
+- **Tests that trigger Stop/Notification or Ctrl+Enter**: put fakes for
+  `notify-send` / `wl-paste` first in PATH — otherwise you pop notifications
+  on the user's desktop or submit their real clipboard to the model.
+- **`/clear` resets CC's cwd** to the start dir, and `! cd` outside the
+  allowed dirs is reset too — why `/~/name` opens a *new* cld-pi via a
+  copied launch command instead of moving this session.
 - **Interactive mode (`src/pi/`) must not use `terminal.zig`.** The real
   terminal answers CC's DEC queries; fake replies would double up.
 - **zmux never emits `session_exited` on pty EOF** — it only marks the
