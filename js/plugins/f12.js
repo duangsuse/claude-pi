@@ -208,7 +208,7 @@ export const f12 = ({ home = homedir(), env = process.env, cdp = cdpLib, shots =
   const offline = () =>
     pi.dialog({
       title: 'Chrome remote debugging is off',
-      body: `Open ${inspectUrl} in Chrome (144+),\nallow remote debugging, then Tab again.\nThe MCP's allowedUrlPattern needs Chrome 149+.`,
+      body: `Open ${inspectUrl} in Chrome,\nallow remote debugging, then Tab again.\nallowedUrlPattern needs Chrome 149+.`,
       'Copy URL': () => void copy(pi, inspectUrl),
       OK: () => {},
     })

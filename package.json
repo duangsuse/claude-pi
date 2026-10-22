@@ -1,6 +1,6 @@
 {
   "name": "cld-pi",
-  "version": "0.2.0",
+  "version": "0.0.1",
   "description": "claude-p fork: `claude -p` drop-in plus an interactive TUI shell around Claude Code (fullscreen), with prefix completion, overlays and JS plugins.",
   "keywords": [
     "claude",
@@ -45,5 +45,13 @@
   ],
   "engines": {
     "node": ">=18"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/duangsuse/claude-pi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/duangsuse/claude-pi/issues"
+  },
+  "homepage": "https://github.com/duangsuse/claude-pi#readme"
 }
