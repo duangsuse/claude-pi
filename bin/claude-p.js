@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 // Thin shim that execs the platform-specific prebuilt `claude-p` binary
-// downloaded by scripts/install.js into ../prebuilt/.
+// downloaded into ../prebuilt/.
+//
+// The download normally happens in `postinstall`, but npm 11.19+ gates
+// dependency install scripts behind its allow-scripts allowlist and `npx`
+// skips them silently, so the shim also ensures the binary itself. That is
+// what makes `npx cld-pi` work on a fresh machine.
 
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { ensureInstalled } = require("../scripts/install.js");
 
 function platformDir() {
   const platform = process.platform;
@@ -18,12 +24,13 @@ function binaryPath() {
   return path.join(dir, name);
 }
 
-function main() {
+async function main() {
   const bin = binaryPath();
-  if (!fs.existsSync(bin)) {
+  if (!fs.existsSync(bin) && !(await ensureInstalled())) {
     console.error(
       `claude-p: prebuilt binary not found at ${bin}\n` +
-        `Re-run \`npm install claude-p\` or build from source with \`zig build\`.`,
+        `The download failed (see above). If you are behind a proxy, check ` +
+        `HTTPS_PROXY/NO_PROXY, or build from source with \`zig build\`.`,
     );
     process.exit(2);
   }
@@ -44,4 +51,7 @@ function main() {
   process.exit(result.status ?? 0);
 }
 
-main();
+main().catch((err) => {
+  console.error("claude-p:", err.stack || err.message);
+  process.exit(2);
+});

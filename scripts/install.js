@@ -1,6 +1,11 @@
 #!/usr/bin/env node
-// Postinstall: download the prebuilt `claude-p` binary for the current
-// platform/arch from a GitHub release and drop it into prebuilt/<plat>-<arch>/.
+// Download the prebuilt `claude-p` binary for the current platform/arch from
+// a GitHub release and drop it into prebuilt/<plat>-<arch>/.
+//
+// Used both as the npm `postinstall` script and from `bin/claude-p.js`, so
+// `npx cld-pi` still works when npm skips install scripts (npm 11.19+ gates
+// dependency scripts behind its allow-scripts allowlist and npx skips them
+// silently by default).
 //
 // Strategy:
 //   1. If a binary already exists at the expected path (e.g. installed from
@@ -11,14 +16,20 @@
 //      https://github.com/<repository>/releases/download/v<version>/claude-p-<plat>-<arch>.gz
 //      (repo taken from package.json), gunzip, and chmod +x.
 //
-// If `CLAUDE_P_SKIP_DOWNLOAD=1` is set, exit 0 without doing anything (useful
-// for monorepo bootstraps where the binary is provided out-of-band).
+// Proxy: Node's https client ignores HTTPS_PROXY, so when a proxy is
+// configured (and curl is available) the download goes through curl, which
+// honours the standard proxy variables. A failed direct request also falls
+// back to curl.
+//
+// If `CLAUDE_P_SKIP_DOWNLOAD=1` is set, do nothing (useful for monorepo
+// bootstraps where the binary is provided out-of-band).
 
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const https = require("node:https");
 const zlib = require("node:zlib");
-const { execFileSync } = require("node:child_process");
+const { spawnSync } = require("node:child_process");
 
 const pkg = require("../package.json");
 
@@ -57,31 +68,93 @@ function isSupported() {
   return okPlatform && okArch;
 }
 
-function get(url) {
+function proxyConfigured() {
+  return Boolean(
+    process.env.HTTPS_PROXY ||
+      process.env.https_proxy ||
+      process.env.HTTP_PROXY ||
+      process.env.http_proxy ||
+      process.env.ALL_PROXY ||
+      process.env.all_proxy,
+  );
+}
+
+let curlChecked = null;
+function hasCurl() {
+  if (curlChecked === null) {
+    const r = spawnSync("curl", ["--version"], { stdio: "ignore" });
+    curlChecked = !r.error && r.status === 0;
+  }
+  return curlChecked;
+}
+
+function getHttps(url) {
   return new Promise((resolve, reject) => {
-    https
-      .get(url, (res) => {
-        if (
-          res.statusCode &&
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
-          // Follow redirect (GitHub release assets do this).
-          resolve(get(res.headers.location));
-          return;
-        }
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-          return;
-        }
-        const chunks = [];
-        res.on("data", (c) => chunks.push(c));
-        res.on("end", () => resolve(Buffer.concat(chunks)));
-        res.on("error", reject);
-      })
-      .on("error", reject);
+    const req = https.get(url, { timeout: 30_000 }, (res) => {
+      if (
+        res.statusCode &&
+        res.statusCode >= 300 &&
+        res.statusCode < 400 &&
+        res.headers.location
+      ) {
+        // Follow redirect (GitHub release assets do this).
+        res.resume();
+        resolve(getHttps(res.headers.location));
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+        return;
+      }
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(Buffer.concat(chunks)));
+      res.on("error", reject);
+    });
+    req.on("timeout", () => req.destroy(new Error(`timed out fetching ${url}`)));
+    req.on("error", reject);
   });
+}
+
+function getCurl(url) {
+  const tmp = path.join(os.tmpdir(), `claude-p-${process.pid}-${Date.now()}.gz`);
+  try {
+    const r = spawnSync(
+      "curl",
+      [
+        "-fsSL",
+        "--retry",
+        "3",
+        "--connect-timeout",
+        "20",
+        "--max-time",
+        "300",
+        "-o",
+        tmp,
+        url,
+      ],
+      { stdio: ["ignore", "ignore", "inherit"] },
+    );
+    if (r.error) throw r.error;
+    if (r.status !== 0) throw new Error(`curl exited ${r.status} for ${url}`);
+    return fs.readFileSync(tmp);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+async function get(url) {
+  if (proxyConfigured() && hasCurl()) return getCurl(url);
+  try {
+    return await getHttps(url);
+  } catch (err) {
+    if (hasCurl()) {
+      log(`direct download failed (${err.message}); retrying with curl`);
+      return getCurl(url);
+    }
+    throw err;
+  }
 }
 
 // GitHub repo the release assets live on, from package.json `repository`.
@@ -91,43 +164,49 @@ function releaseRepo() {
   return m ? m[1] : null;
 }
 
-async function download() {
+async function download(say) {
   const repo = releaseRepo();
   if (!repo) throw new Error("package.json has no GitHub `repository`; no release to download from");
   const url = `https://github.com/${repo}/releases/download/v${pkg.version}/claude-p-${platformDir()}.gz`;
-  log(`downloading ${url}`);
+  say(`downloading ${url}`);
   const gz = await get(url);
   const bin = zlib.gunzipSync(gz);
   const dest = targetPath();
   ensureDir(path.dirname(dest));
   fs.writeFileSync(dest, bin, { mode: 0o755 });
-  log(`installed ${dest} (${bin.length} bytes)`);
+  say(`installed ${dest} (${bin.length} bytes)`);
 }
 
-async function main() {
+// Returns true when the binary is present afterwards. Never throws.
+async function ensureInstalled({ quiet = false } = {}) {
+  const say = quiet ? () => {} : log;
   if (process.env.CLAUDE_P_SKIP_DOWNLOAD === "1") {
-    log("CLAUDE_P_SKIP_DOWNLOAD set; skipping");
-    return;
+    say("CLAUDE_P_SKIP_DOWNLOAD set; skipping");
+    return alreadyInstalled();
   }
   if (!isSupported()) {
-    log(`platform ${platformDir()} not supported; skipping`);
-    return;
+    say(`platform ${platformDir()} not supported; skipping`);
+    return false;
   }
   if (alreadyInstalled()) {
-    log(`already installed at ${targetPath()}`);
-    return;
+    say(`already installed at ${targetPath()}`);
+    return true;
   }
   try {
-    await download();
+    await download(say);
+    return true;
   } catch (err) {
-    log(`download failed: ${err.message}`);
-    log("you can build from source with: zig build -Doptimize=ReleaseSafe");
-    // Don't fail the install — leave the binary missing; the shim will
-    // print a clear error if the user runs `claude-p` later.
+    say(`download failed: ${err.message}`);
+    say("you can build from source with: zig build -Doptimize=ReleaseSafe");
+    return false;
   }
 }
 
-main().catch((err) => {
-  log(`unexpected error: ${err.stack || err.message}`);
-  // Same as above: don't break the npm install.
-});
+module.exports = { ensureInstalled, targetPath, platformDir, isSupported };
+
+if (require.main === module) {
+  ensureInstalled().catch((err) => {
+    log(`unexpected error: ${err.stack || err.message}`);
+    // Don't break the npm install; the shim reports the missing binary.
+  });
+}

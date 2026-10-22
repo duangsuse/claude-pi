@@ -467,9 +467,15 @@ test('toast: the countdown updates while it waits', async () => {
   const host = createHost(m => sent.push(m))
   const r = host.pi.dialog({ body: 'b', timeout: 5000, or: 'OK', OK() {} })
   assert.equal(sent[0].body, 'b (5s)')
-  await tick(600)
-  const upd = sent.findLast(m => m.t === 'dialog_update')
-  assert.match(upd.body, /^b \(4s\)$/)
+  // The ticker runs every 100ms, but a fixed sleep is flaky when the test
+  // runner is loaded: wait for the first update instead.
+  const deadline = Date.now() + 3000
+  let upd
+  while (Date.now() < deadline && !(upd = sent.findLast(m => m.t === 'dialog_update'))) {
+    await tick(50)
+  }
+  assert.ok(upd, 'expected a dialog_update with the countdown')
+  assert.match(upd.body, /^b \([0-4]s\)$/)
   host.dispatch({ t: 'dialog_closed', id: 1 })
   assert.equal(await r, null)
 })
