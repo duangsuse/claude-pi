@@ -34,7 +34,9 @@ const { spawnSync } = require("node:child_process");
 const pkg = require("../package.json");
 
 function log(msg) {
-  process.stderr.write(`claude-p (install): ${msg}\n`);
+  for (const line of String(msg).split("\n")) {
+    process.stderr.write(`claude-p (install): ${line}\n`);
+  }
 }
 
 function platformDir() {
@@ -66,6 +68,32 @@ function isSupported() {
   const okPlatform = ["darwin", "linux"].includes(process.platform);
   const okArch = ["x64", "arm64"].includes(process.arch);
   return okPlatform && okArch;
+}
+
+// Shown by both the postinstall script and the bin shim. Windows users get
+// the WSL + Windows Terminal one-liners instead of a silent missing binary.
+function unsupportedMessage(platform = process.platform) {
+  if (platform === "win32") {
+    return [
+      "native Windows is not supported; cld-pi runs inside WSL (Linux).",
+      "",
+      "  wsl --install                                     # WSL + Ubuntu, one time",
+      "  winget install --id Microsoft.WindowsTerminal -e  # Windows Terminal",
+      "",
+      "Then open the Ubuntu terminal and run: npx cld-pi",
+    ].join("\n");
+  }
+  return `platform ${platformDir()} is not supported (need darwin/linux x64/arm64)`;
+}
+
+// npm strips the executable bit in a few situations (tar extraction, some
+// filesystems/umasks), so set it explicitly before the shim spawns the binary.
+function ensureExecutable(p) {
+  try {
+    fs.chmodSync(p, 0o755);
+  } catch {
+    // Best effort; the spawn below will report EACCES if it really matters.
+  }
 }
 
 function proxyConfigured() {
@@ -174,6 +202,7 @@ async function download(say) {
   const dest = targetPath();
   ensureDir(path.dirname(dest));
   fs.writeFileSync(dest, bin, { mode: 0o755 });
+  ensureExecutable(dest);
   say(`installed ${dest} (${bin.length} bytes)`);
 }
 
@@ -185,10 +214,11 @@ async function ensureInstalled({ quiet = false } = {}) {
     return alreadyInstalled();
   }
   if (!isSupported()) {
-    say(`platform ${platformDir()} not supported; skipping`);
+    say(unsupportedMessage());
     return false;
   }
   if (alreadyInstalled()) {
+    ensureExecutable(targetPath());
     say(`already installed at ${targetPath()}`);
     return true;
   }
@@ -202,7 +232,13 @@ async function ensureInstalled({ quiet = false } = {}) {
   }
 }
 
-module.exports = { ensureInstalled, targetPath, platformDir, isSupported };
+module.exports = {
+  ensureInstalled,
+  unsupportedMessage,
+  targetPath,
+  platformDir,
+  isSupported,
+};
 
 if (require.main === module) {
   ensureInstalled().catch((err) => {

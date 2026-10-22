@@ -10,7 +10,7 @@
 const { spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
-const { ensureInstalled } = require("../scripts/install.js");
+const { ensureInstalled, unsupportedMessage } = require("../scripts/install.js");
 
 function platformDir() {
   const platform = process.platform;
@@ -25,6 +25,10 @@ function binaryPath() {
 }
 
 async function main() {
+  if (process.platform === "win32") {
+    console.error(unsupportedMessage("win32"));
+    process.exit(2);
+  }
   const bin = binaryPath();
   if (!fs.existsSync(bin) && !(await ensureInstalled())) {
     console.error(
@@ -33,6 +37,12 @@ async function main() {
         `HTTPS_PROXY/NO_PROXY, or build from source with \`zig build\`.`,
     );
     process.exit(2);
+  }
+  // npm/tar can lose the executable bit; make sure spawnSync can exec it.
+  try {
+    fs.chmodSync(bin, 0o755);
+  } catch {
+    // Best effort; spawnSync below reports the real error.
   }
   // Tell the binary where the node sidecar (js/host.js) lives.
   const env = { ...process.env, CLAUDE_P_JS: path.join(__dirname, "..", "js") };

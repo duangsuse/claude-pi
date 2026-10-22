@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import install from "../../scripts/install.js";
 
-const { ensureInstalled, targetPath, platformDir } = install;
+const { ensureInstalled, unsupportedMessage, targetPath, platformDir } = install;
 
 test("install.js imports without side effects and exposes the lazy installer", () => {
   assert.equal(typeof ensureInstalled, "function");
@@ -17,4 +17,11 @@ test("platformDir and targetPath point at prebuilt/<platform>-<arch>/", () => {
   const dir = `${process.platform}-${process.arch}`;
   assert.equal(platformDir(), dir);
   assert.match(targetPath(), new RegExp(`prebuilt[\\\\/]${dir}[\\\\/]claude-p(\\.exe)?$`));
+});
+
+test("Windows is pointed at WSL and a one-line Windows Terminal install", () => {
+  const msg = unsupportedMessage("win32");
+  assert.match(msg, /WSL/i);
+  assert.match(msg, /wsl --install/);
+  assert.match(msg, /winget install --id Microsoft\.WindowsTerminal -e/);
 });

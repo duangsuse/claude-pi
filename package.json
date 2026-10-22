@@ -1,6 +1,6 @@
 {
   "name": "cld-pi",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "claude-p fork: `claude -p` drop-in plus an interactive TUI shell around Claude Code (fullscreen), with prefix completion, overlays and JS plugins.",
   "keywords": [
     "claude",
@@ -35,10 +35,6 @@
     "release:dry-run": "node scripts/publish.mjs --dry-run",
     "release:local": "node scripts/publish.mjs --local-only"
   },
-  "os": [
-    "darwin",
-    "linux"
-  ],
   "cpu": [
     "x64",
     "arm64"

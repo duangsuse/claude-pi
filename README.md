@@ -26,6 +26,19 @@ npx cld-pi -a codex                      # wrap another TUI (set pi.arg.prompt /
 
 Requires `claude` on `$PATH`, Node ≥ 18, macOS or Linux.
 
+### Windows
+
+Native Windows isn't supported — the wrapper needs a Linux PTY. Run it inside
+WSL; these two one-liners install WSL + Ubuntu and Windows Terminal (the
+terminal app):
+
+```powershell
+wsl --install
+winget install --id Microsoft.WindowsTerminal -e
+```
+
+Then open the Ubuntu tab and run `npx cld-pi`.
+
 `npm i -g cld-pi` installs the same thing as the `claude-p` command (and
 `cld-pi`). On first run it prints a one-liner that binds **Ctrl+P** in your
 shell to `claude-p`. Nothing is written to your rc files for you.

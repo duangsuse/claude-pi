@@ -25,6 +25,18 @@ npx cld-pi -a codex                      # 套别的 TUI（用 pi.arg.prompt / b
 
 需要 `$PATH` 里有 `claude`、Node ≥ 18，支持 macOS 和 Linux。
 
+### Windows
+
+原生 Windows 不支持（外壳需要 Linux PTY）。请在 WSL 里运行；下面两条一键安装
+WSL + Ubuntu 和 Windows Terminal（终端 App）：
+
+```powershell
+wsl --install
+winget install --id Microsoft.WindowsTerminal -e
+```
+
+然后在 Ubuntu 终端里运行 `npx cld-pi`。
+
 `npm i -g cld-pi` 会安装同一个程序，命令名仍是 `claude-p`（另有 `cld-pi`）。首次运行时
 会打印一行命令，用来在 shell 里把 **Ctrl+P** 绑定为启动 `claude-p`。它只打印，不会替你改
 rc 文件。
